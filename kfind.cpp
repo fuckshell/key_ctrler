@@ -127,11 +127,42 @@ std::string get_key_name(int keycode) {
 
 // 监听单个输入设备
 void monitor_input_device(const std::string& device_path) {
+    // 使用非阻塞模式打开设备，以便后续可以设置非阻塞标志
     int fd = open(device_path.c_str(), O_RDONLY | O_NONBLOCK);
     if (fd == -1) {
-        LOGE("Failed to open device: %s - %s", device_path.c_str(), strerror(errno));
-        std::cerr << "Error: Cannot open device " << device_path << ": " << strerror(errno) << std::endl;
-        std::cerr << "Make sure you have root permissions and the device path is correct." << std::endl;
+        int open_errno = errno;
+        LOGE("Failed to open device: %s - %s (errno=%d)", device_path.c_str(), strerror(open_errno), open_errno);
+        std::cerr << "Error: Cannot open device " << device_path << ": " << strerror(open_errno) << std::endl;
+        
+        // 提供具体的错误诊断
+        if (open_errno == EINVAL) {
+            std::cerr << "错误: 无效的参数或设备不支持当前打开模式" << std::endl;
+            std::cerr << "建议: " << std::endl;
+            std::cerr << "1. 检查设备路径是否正确: " << device_path << std::endl;
+            std::cerr << "2. 尝试使用其他event设备" << std::endl;
+            std::cerr << "3. 检查设备是否存在: ls -la " << device_path << std::endl;
+        } else if (open_errno == EACCES) {
+            std::cerr << "错误: 权限不足，请确保以root权限运行" << std::endl;
+        } else if (open_errno == ENOENT) {
+            std::cerr << "错误: 设备文件不存在" << std::endl;
+        } else {
+            std::cerr << "Make sure you have root permissions and the device path is correct." << std::endl;
+        }
+        return;
+    }
+    
+    // 验证设备是否真的是输入设备
+    struct stat st;
+    if (fstat(fd, &st) == -1) {
+        LOGE("Failed to stat device: %s - %s", device_path.c_str(), strerror(errno));
+        close(fd);
+        return;
+    }
+    
+    if (!S_ISCHR(st.st_mode)) {
+        LOGE("Device is not a character device: %s", device_path.c_str());
+        std::cerr << "错误: " << device_path << " 不是有效的输入设备" << std::endl;
+        close(fd);
         return;
     }
     
@@ -142,34 +173,21 @@ void monitor_input_device(const std::string& device_path) {
     }
     
     struct input_event event;
+    int retry_count = 0;
+    const int max_retries = 3;
     
     while (g_running) {
         ssize_t bytes = read(fd, &event, sizeof(event));
-        if (bytes != sizeof(event)) {
-            if (bytes == -1) {
-                if (errno == EINTR) {
-                    if (!g_running) break; // 检查是否需要退出
-                    continue; // 被信号中断，继续读取
-                } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    // 非阻塞模式下没有数据可读，短暂休眠后继续
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                    continue;
-                } else {
-                    LOGE("Failed to read event: %s", strerror(errno));
-                    break;
-                }
-            } else {
-                // 读取的字节数不正确
-                continue;
+        if (bytes == sizeof(event)) {
+            // 成功读取到事件，重置重试计数
+            retry_count = 0;
+          
+            // 再次检查g_running状态
+            if (!g_running) {
+                break;
             }
-        }
-        
-        // 再次检查g_running状态
-        if (!g_running) {
-            break;
-        }
-        
-        // 只处理按键事件
+            
+            // 只处理按键事件
             if (event.type == EV_KEY) {
                 std::string key_name = get_key_name(event.code);
                 std::string event_type;
@@ -222,6 +240,55 @@ void monitor_input_device(const std::string& device_path) {
                     }
                 }
             }
+        } else if (bytes == -1) {
+            if (errno == EINTR) {
+                continue; // 被信号中断，继续读取
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // 非阻塞模式下没有数据可读，短暂休眠后继续
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                retry_count = 0; // 这是正常情况，重置重试计数
+                continue;
+            } else if (errno == ENODEV) {
+                // 设备已断开连接
+                LOGE("Device disconnected: %s", device_path.c_str());
+                std::cerr << "设备已断开连接: " << device_path << std::endl;
+                break;
+            } else {
+                // 其他读取错误，记录详细错误信息
+                LOGE("Error reading from device %s: %s (errno=%d)", 
+                     device_path.c_str(), strerror(errno), errno);
+                std::cerr << "读取设备错误: " << device_path << " - " << strerror(errno) << std::endl;
+                
+                retry_count++;
+                if (retry_count >= max_retries) {
+                    LOGE("Max retries reached for device %s, stopping monitor", device_path.c_str());
+                    std::cerr << "达到最大重试次数，停止监听: " << device_path << std::endl;
+                    break;
+                }
+                
+                // 短暂延迟后重试
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+        } else if (bytes == 0) {
+            // 读到文件末尾（设备可能已断开）
+            LOGE("End of file reached for device: %s", device_path.c_str());
+            std::cerr << "设备文件结束: " << device_path << std::endl;
+            break;
+        } else {
+            // 读取到不完整的数据
+            LOGE("Incomplete read from device %s: expected %zu bytes, got %zd bytes", 
+                 device_path.c_str(), sizeof(event), bytes);
+            std::cerr << "读取数据不完整: " << device_path << " - 期望 " << sizeof(event) 
+                      << " 字节，实际 " << bytes << " 字节" << std::endl;
+            retry_count++;
+            if (retry_count >= max_retries) {
+                LOGE("Max incomplete read retries reached for device %s", device_path.c_str());
+                std::cerr << "数据不完整重试次数过多，停止监听: " << device_path << std::endl;
+                break;
+            }
+            continue;
+        }
     }
     
     close(fd);

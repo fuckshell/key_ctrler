@@ -34,6 +34,8 @@
 #include <sys/resource.h>
 #include <sched.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #define LOG_TAG "KCTRL"
 #define LOG_FILE "/data/adb/modules/kctrl/klog.log"
@@ -128,6 +130,8 @@ static int g_double_click_interval = 300;
 
 // 日志开关配置
 static bool g_enable_log = false;
+// 新增：全局配置文件路径，便于线程内重新加载配置确认独占
+static std::string g_config_path;
 
 // 信号处理函数
 void signal_handler(int sig) {
@@ -553,18 +557,105 @@ void key_release_timer(int keycode, long long duration) {
 
 // 监听输入设备事件
 void monitor_input_device(const std::string& device_path) {
-    int fd = open(device_path.c_str(), O_RDONLY);
+    // 尝试以非阻塞模式打开设备，避免阻塞线程
+    int fd = open(device_path.c_str(), O_RDONLY | O_NONBLOCK);
     if (fd == -1) {
-        LOGE("Failed to open input device %s: %s", device_path.c_str(), strerror(errno));
+        int open_errno = errno;
+        LOGE("Failed to open input device %s: %s (errno=%d)", device_path.c_str(), strerror(open_errno), open_errno);
+        
+        // 提供具体的错误诊断
+        if (open_errno == EINVAL) {
+            LOGE("建议: 检查设备路径是否正确，或尝试使用其他event设备");
+        } else if (open_errno == EACCES) {
+            LOGE("建议: 确保以root权限运行");
+        } else if (open_errno == ENOENT) {
+            LOGE("建议: 设备文件不存在，请检查路径");
+        }
         return;
+    }
+
+    // 独占设备（EVIOCGRAB）逻辑：由配置 udevice/odevice 控制
+    bool grabbed = false;
+    int udevice = 0;
+    int odevice = 0;
+    {
+        // 读取当前配置
+        std::lock_guard<std::mutex> lock(g_global_mutex);
+        auto it_u = g_config.find("udevice");
+        auto it_o = g_config.find("odevice");
+        if (it_u != g_config.end()) udevice = std::atoi(it_u->second.c_str());
+        if (it_o != g_config.end()) odevice = std::atoi(it_o->second.c_str());
+    }
+
+    if (udevice == 1) {
+        // 申请独占
+        if (ioctl(fd, EVIOCGRAB, 1) == 0) {
+            grabbed = true;
+            LOGI("EVIOCGRAB 独占成功: %s", device_path.c_str());
+        } else {
+            LOGW("EVIOCGRAB 独占失败(%s)，将以非独占方式继续: %s", strerror(errno), device_path.c_str());
+        }
+
+        // 如果独占成功且未立即确认（odevice==0），则等待10秒后重新读取配置进行确认
+        if (grabbed && odevice == 0) {
+            LOGI("已独占设备，等待10秒以确认(在配置中设置 odevice=1 以继续，或保持0以释放并退出)");
+            // 可中断的等待，总计约10秒
+            for (int i = 0; i < 100 && g_running; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            if (g_running) {
+                // 重新加载配置以读取最新的odevice
+                bool reload_ok = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_global_mutex);
+                    reload_ok = load_config(g_config_path.c_str());
+                }
+                 if (!reload_ok) {
+                     LOGW("重新加载配置失败，按未确认处理(odevice=0)");
+                 }
+                 // 读取最新的odevice
+                 {
+                     std::lock_guard<std::mutex> lock(g_global_mutex);
+                     auto it_o2 = g_config.find("odevice");
+                     odevice = (it_o2 != g_config.end()) ? std::atoi(it_o2->second.c_str()) : 0;
+                 }
+                if (odevice == 0) {
+                    // 未确认，释放独占并请求整体退出
+                    ioctl(fd, EVIOCGRAB, 0);
+                    grabbed = false;
+                    LOGI("未确认独占(odevice=0)，已释放设备独占并准备退出程序");
+                    {
+                        std::lock_guard<std::mutex> lock(g_global_mutex);
+                        g_running = false;
+                    }
+                    g_shutdown_cv.notify_all();
+                    close(fd);
+                    return;
+                } else {
+                    LOGI("已确认独占(odevice=1)，继续运行");
+                }
+            } else {
+                // 程序已要求退出
+                ioctl(fd, EVIOCGRAB, 0);
+                grabbed = false;
+                close(fd);
+                return;
+            }
+        }
     }
     
     LOGI("Monitoring input device: %s", device_path.c_str());
     
     struct input_event ev;
+    int retry_count = 0;
+    const int max_retries = 3;
+    
     while (g_running) {
         ssize_t bytes = read(fd, &ev, sizeof(ev));
         if (bytes == sizeof(ev)) {
+            // 成功读取到事件，重置重试计数
+            retry_count = 0;
+            
             // 只处理按键事件
             if (ev.type == EV_KEY) {
                 if (ev.value == 1) {
@@ -618,10 +709,53 @@ void monitor_input_device(const std::string& device_path) {
                 }
             }
         } else if (bytes == -1) {
-            if (errno == EINTR) continue;
-            LOGE("Error reading from input device: %s", strerror(errno));
+            if (errno == EINTR) {
+                continue; // 被信号中断，继续读取
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // 非阻塞模式下没有数据可读，短暂休眠后继续
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                retry_count = 0; // 这是正常情况，重置重试计数
+                continue;
+            } else if (errno == ENODEV) {
+                // 设备已断开连接
+                LOGE("Device disconnected: %s", device_path.c_str());
+                break;
+            } else {
+                // 其他读取错误，记录详细错误信息
+                LOGE("Error reading from input device %s: %s (errno=%d)", 
+                     device_path.c_str(), strerror(errno), errno);
+                
+                retry_count++;
+                if (retry_count >= max_retries) {
+                    LOGE("Max retries reached for device %s, stopping monitor", device_path.c_str());
+                    break;
+                }
+                
+                // 短暂延迟后重试
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+        } else if (bytes == 0) {
+            // 读到文件末尾（设备可能已断开）
+            LOGE("End of file reached for device: %s", device_path.c_str());
             break;
+        } else {
+            // 读取到不完整的数据
+            LOGE("Incomplete read from device %s: expected %zu bytes, got %zd bytes", 
+                 device_path.c_str(), sizeof(ev), bytes);
+            retry_count++;
+            if (retry_count >= max_retries) {
+                LOGE("Max incomplete read retries reached for device %s", device_path.c_str());
+                break;
+            }
+            continue;
         }
+    }
+    
+    // 退出前释放独占
+    if (grabbed) {
+        ioctl(fd, EVIOCGRAB, 0);
+        LOGI("已释放设备独占: %s", device_path.c_str());
     }
     
     close(fd);
@@ -694,8 +828,8 @@ int main(int argc, char* argv[]) {
     
     // 4. 极致内存优化设置
     // 预分配容器以最小容量减少内存碎片
-    g_config.reserve(8);  // 最小配置项数量
-    g_key_states.reserve(4);  // 最多监听4个按键
+    // g_config.reserve(8);  // 最小配置项数量 - 移除限制
+    // g_key_states.reserve(4);  // 最多监听4个按键 - 移除限制
     
     // 设置内存映射建议，优先回收不活跃页面
     if (madvise(nullptr, 0, MADV_SEQUENTIAL) == 0) {
@@ -717,6 +851,8 @@ int main(int argc, char* argv[]) {
     
     // 加载配置文件
     const char* config_file = (argc > 1) ? argv[1] : "/data/adb/modules/kctrl/config.txt";
+    // 记录配置文件路径，供线程内二次确认独占时重新读取
+    g_config_path = config_file;
     if (!load_config(config_file)) {
         LOGE("Failed to load config file");
         cleanup();
