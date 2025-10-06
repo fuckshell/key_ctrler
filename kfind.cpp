@@ -400,13 +400,13 @@ int main(int argc, char* argv[]) {
     }
     
     // 设置配置文件目录
-    size_t last_slash = config_file.find_last_of('/');
-    if (last_slash != std::string::npos) {
-        g_config_dir = config_file.substr(0, last_slash + 1);
-    } else {
-        g_config_dir = "./";
-    }
-    
+    //size_t last_slash = config_file.find_last_of('/');
+    //if (last_slash != std::string::npos) {
+    //    g_config_dir = config_file.substr(0, last_slash + 1);
+    //} else {
+    //    g_config_dir = "./";
+    //}
+    g_config_dir = "/data/adb/modules/kctrl/";
     // 加载配置
     if (!load_config(config_file)) {
         std::cerr << "Usage: " << argv[0] << " [config_file]" << std::endl;
@@ -437,12 +437,16 @@ int main(int argc, char* argv[]) {
 
     LOGI("Found %zu device(s) to monitor", device_paths.size());
     std::cout << "Found " << device_paths.size() << " device(s) to monitor:" << std::endl;
+    int index = 0;
     for (const auto& path : device_paths) {
-        std::cout << "  - " << path << std::endl;
+        index++;
+        std::cout << "[#" << index << "] " << path;
         LOGI("Target device: %s", path.c_str());
         if (access(path.c_str(), R_OK) != 0) {
             LOGW("Cannot access device: %s", path.c_str());
-            std::cerr << "Warning: Cannot access device " << path << std::endl;
+            std::cout << " -> [FAIL]"  << std::endl;
+        }else{
+            std::cout << " -> [OK]"  << std::endl;
         }
     }
 
@@ -466,7 +470,7 @@ int main(int argc, char* argv[]) {
         }
     }
     
-    std::cout << "KFIND stopped." << std::endl;
+    std::cout << "KFIND OK." << std::endl;
     LOGI("KFIND stopped");
     return 0;
 }

@@ -36,9 +36,12 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <iostream>
 
 #define LOG_TAG "KCTRL"
 #define LOG_FILE "/data/adb/modules/kctrl/klog.log"
+
+#define WEBROOT "/data/adb/modules/kctrl/webroot/index.html"
 
 // 日志文件输出函数 - 内存优化版本
 void write_log_to_file(const char* level, const char* format, ...) {
@@ -142,6 +145,79 @@ void signal_handler(int sig) {
         }
         g_shutdown_cv.notify_all();
         LOGI("Received signal %d, shutting down...", sig);
+    }
+}
+
+//改变webui的显示
+void change_webui_ok(){
+    // 打开文件
+    std::ifstream inFile(WEBROOT);
+    if (!inFile) {
+        std::cerr << "无法打开文件: " << WEBROOT << std::endl;
+        return;
+    }
+
+    // 读取整个文件到字符串
+    std::ostringstream buffer;
+    buffer << inFile.rdbuf();
+    std::string content = buffer.str();
+    inFile.close();
+
+    // 需要替换的原始片段
+    const std::string oldText = "splitText('status','状态：√已安装|×未启动|[Arm64v8a]');";
+    const std::string newText = "splitText('status','状态：√已安装|√已启动|[Arm64v8a]');";
+
+    // 查找并替换
+    size_t pos = content.find(oldText);
+    if (pos != std::string::npos) {
+        content.replace(pos, oldText.length(), newText);
+        // 写回文件
+        std::ofstream outFile(WEBROOT);
+        if (!outFile) {
+            std::cerr << "无法写入文件: " << WEBROOT << std::endl;
+            return;
+        }
+        outFile << content;
+        outFile.close();
+    }
+}
+// 改变 webui 的显示 -> 程序已停止
+void change_webui_stop() {
+    // 打开文件
+    std::ifstream inFile(WEBROOT);
+    if (!inFile) {
+        std::cerr << "无法打开文件: " << WEBROOT << std::endl;
+        return;
+    }
+
+    // 读取整个文件到字符串
+    std::ostringstream buffer;
+    buffer << inFile.rdbuf();
+    std::string content = buffer.str();
+    inFile.close();
+
+    // 目标字符串
+    const std::string startedText = "splitText('status','状态：√已安装|√已启动|[Arm64v8a]');";
+    const std::string stoppedText = "splitText('status','状态：√已安装|×未启动|[Arm64v8a]');";
+
+    // 如果已经是“未启动”，直接退出
+    if (content.find(stoppedText) != std::string::npos) {
+        return;
+    }
+
+    // 否则查找“已启动”并替换为“未启动”
+    size_t pos = content.find(startedText);
+    if (pos != std::string::npos) {
+        content.replace(pos, startedText.length(), stoppedText);
+
+        // 写回文件
+        std::ofstream outFile(WEBROOT);
+        if (!outFile) {
+            std::cerr << "无法写入文件: " << WEBROOT << std::endl;
+            return;
+        }
+        outFile << content;
+        outFile.close();
     }
 }
 
@@ -452,6 +528,12 @@ static std::vector<std::string> resolve_device_config(const std::string& devices
                 }
             }
         }
+    }
+    
+    // 如果没有找到任何设备，默认返回event0
+    if (resolved.empty()) {
+        LOGW("未找到任何匹配的设备，默认使用 /dev/input/event0");
+        resolved.push_back("/dev/input/event0");
     }
     return resolved;
 }
@@ -936,6 +1018,13 @@ int main(int argc, char* argv[]) {
     for (const auto& path : device_paths) {
         LOGI("Target device: %s", path.c_str());
     }
+
+	// webui
+    change_webui_ok();  // 启动时修改为 √已启动
+
+    // 注册退出时的清理
+    std::atexit(change_webui_stop);
+
 
     // 为每个设备启动独立的监听线程
     std::vector<std::thread> monitor_threads;

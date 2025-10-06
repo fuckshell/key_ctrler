@@ -11,7 +11,9 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -O2")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -O2")
 
 # 添加可执行文件
-add_executable(kctrl main.cpp)
+add_executable(kctrl kctrl.cpp
+        scenexec.cpp)
+add_executable(opxiii opxiii.cpp)
 
 # 链接Android库
 find_library(log-lib log)
@@ -23,8 +25,18 @@ target_link_libraries(kctrl
     -static-libstdc++
 )
 
+target_link_libraries(opxiii
+    ${log-lib}
+    ${android-lib}
+    -static-libstdc++
+)
+
 # 设置目标属性
 set_target_properties(kctrl PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+set_target_properties(opxiii PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
@@ -33,8 +45,17 @@ target_compile_definitions(kctrl PRIVATE
     ANDROID_NDK
 )
 
+target_compile_definitions(opxiii PRIVATE
+    ANDROID_NDK
+)
+
 # 包含头文件目录
 target_include_directories(kctrl PRIVATE
+    ${ANDROID_NDK}/sysroot/usr/include
+    ${ANDROID_NDK}/sysroot/usr/include/linux
+)
+
+target_include_directories(opxiii PRIVATE
     ${ANDROID_NDK}/sysroot/usr/include
     ${ANDROID_NDK}/sysroot/usr/include/linux
 )

@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>KCtrl API 状态</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            overflow: hidden;
+            font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            background: transparent;
+        }
+
+        canvas {
+            position: fixed;
+            top: 0;
+            left: 0;
+            z-index: -2; /* 背景 */
+        }
+
+        .status-card {
+            background: rgba(255,255,255,0.15);
+            backdrop-filter: blur(15px);
+            -webkit-backdrop-filter: blur(15px);
+            border-radius: 20px;
+            padding: 40px 60px;
+            text-align: center;
+            border: 1px solid rgba(255,255,255,0.2);
+            box-shadow: 0 8px 24px rgba(0,0,0,0.35); /* 修复阴影，让它更自然 */
+        }
+
+        .status-card span {
+            transition: color 0.1s linear;
+            display: inline-block;
+            text-shadow: 0 1px 3px rgba(0,0,0,0.5); /* 给每个字符阴影增强可读性 */
+        }
+
+        .by-info {
+            position: fixed;
+            bottom: 10px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 0.9em;
+            transition: color 0.1s linear;
+            display: flex;
+        }
+
+        .by-info span {
+            display: inline-block;
+            text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+            transition: color 0.1s linear;
+        }
+    </style>
+</head>
+<body>
+<canvas id="waveCanvas"></canvas>
+
+<div class="status-card" id="statusCard">
+    <h1 id="title"></h1>
+    <p id="status"></p>
+    <a href="api.html"><p id="level"></p></a>
+</div>
+
+<div class="by-info" id="byInfo"></div>
+
+<script>
+    const canvas = document.getElementById('waveCanvas');
+    const ctx = canvas.getContext('2d');
+    let width = canvas.width = window.innerWidth;
+    let height = canvas.height = window.innerHeight;
+
+    const waves = [
+        {y: height/2, amplitude: 50, wavelength: 200, speed: 0.02, phase: 0, color: 'rgba(0,255,255,0.3)'},
+        {y: height/2 + 20, amplitude: 30, wavelength: 150, speed: 0.015, phase: 0, color: 'rgba(0,150,255,0.3)'}
+    ];
+
+    // 拆分文字为 span
+    function splitText(id, text){
+        const container = document.getElementById(id);
+        container.innerHTML = '';
+        text.split('').forEach(char=>{
+            const span = document.createElement('span');
+            span.textContent = char;
+            container.appendChild(span);
+        });
+    }
+
+    splitText('title','KCtrlAPI');
+    splitText('status','状态：√已安装|[Arm64v8a]');
+    splitText('level','>API等级：108<');
+    splitText('byInfo','By. IDlike');
+
+    const elements = [
+        ...document.querySelectorAll('.status-card span'),
+        ...document.querySelectorAll('.by-info span')
+    ];
+
+    function drawWaves(){
+        ctx.clearRect(0,0,width,height);
+
+        // 绘制渐变背景
+        const gradient = ctx.createLinearGradient(0,0,0,height);
+        gradient.addColorStop(0,'rgba(111,195,255,0.3)'); // 上浅
+        gradient.addColorStop(1,'rgba(10,28,59,0.6)');   // 下深
+        ctx.fillStyle = gradient;
+        ctx.fillRect(0,0,width,height);
+
+        // 绘制波浪
+        waves.forEach(wave => {
+            ctx.beginPath();
+            ctx.moveTo(0, wave.y);
+            for(let x=0;x<=width;x+=1){
+                let y = wave.y + Math.sin((x/wave.wavelength)+wave.phase)*wave.amplitude;
+                ctx.lineTo(x, y);
+            }
+            ctx.lineTo(width,height);
+            ctx.lineTo(0,height);
+            ctx.closePath();
+            ctx.fillStyle = wave.color;
+            ctx.fill();
+            wave.phase += wave.speed;
+        });
+
+        // 动态每个 span 颜色
+        elements.forEach(span=>{
+            const rect = span.getBoundingClientRect();
+            const centerX = rect.left + rect.width/2;
+            const centerY = rect.top + rect.height/2;
+            if(centerX >=0 && centerX < width && centerY >=0 && centerY < height){
+                const pixel = ctx.getImageData(centerX,centerY,1,1).data;
+                const brightness = 0.299*pixel[0]+0.587*pixel[1]+0.114*pixel[2];
+                span.style.color = brightness<128 ? '#ffffff' : '#00c4ff';
+            }
+        });
+
+        requestAnimationFrame(drawWaves);
+    }
+
+    drawWaves();
+
+    window.addEventListener('resize',()=>{
+        width = canvas.width = window.innerWidth;
+        height = canvas.height = window.innerHeight;
+    });
+</script>
+</body>
+</html>

@@ -317,6 +317,94 @@ ps | grep kctrl
 cat ./mpid.txt
 ```
 
+### 常见错误及解决方法
+
+#### 1. "Invalid argument" (EINVAL) 错误
+
+**问题描述**: 程序启动时出现"Invalid argument"或"无效的参数"错误
+
+**可能原因**:
+- 设备路径不正确
+- 设备不是有效的输入设备
+- 设备权限不足
+
+**解决方法**:
+
+1. **使用诊断工具**:
+```bash
+# 在设备上运行诊断脚本
+adb shell
+su
+cd /data/adb/modules/kctrl
+./diagnose.sh
+```
+
+2. **手动检查设备**:
+```bash
+# 检查设备是否存在且有效
+ls -la /dev/input/event*
+
+# 验证设备类型
+file /dev/input/event0
+
+# 测试设备是否可读
+cat /dev/input/event0 > /dev/null &
+# 按Ctrl+C退出测试
+```
+
+3. **使用正确的设备路径**:
+```bash
+# 查看可用的输入设备
+cat /proc/bus/input/devices | grep -E "^N:|^H:"
+
+# 使用getevent测试设备
+getevent -l /dev/input/event0
+```
+
+4. **更新配置文件**:
+确保`config.txt`中的设备路径正确:
+```ini
+# 使用正确的设备路径
+devices=/dev/input/event2,/dev/input/event3
+```
+
+#### 2. "Permission denied" (EACCES) 错误
+
+**解决方法**:
+```bash
+# 确保以root权限运行
+adb shell
+su
+cd /data/adb/modules/kctrl
+./kctrl
+```
+
+#### 3. "No such file or directory" (ENOENT) 错误
+
+**解决方法**:
+```bash
+# 检查设备是否存在
+ls -la /dev/input/event*
+
+# 如果设备不存在，可能需要重新插拔设备或重启
+```
+
+### 故障排除工具
+
+项目提供了专门的诊断工具来帮助解决问题：
+
+- **diagnose.sh**: Android shell脚本，用于设备诊断
+- **diagnose.bat**: Windows批处理脚本，通过ADB诊断设备
+
+使用方法：
+```bash
+# Android设备上运行
+./diagnose.sh
+
+# Windows上通过ADB运行
+diagnose.bat
+```
+
 ## 作者
 
 **IDlike** - 项目作者和维护者

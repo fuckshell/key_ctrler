@@ -28,3 +28,15 @@ LOCAL_SRC_FILES := klaunch.cpp
 LOCAL_CPPFLAGS := -std=c++11 -Wall -Wextra
 LOCAL_LDLIBS := -llog
 include $(BUILD_EXECUTABLE)
+
+# OPXIII模块
+include $(CLEAR_VARS)
+LOCAL_MODULE := opxiii
+LOCAL_SRC_FILES := opxiii.cpp
+LOCAL_CPPFLAGS := -std=c++17 -Wall -Wextra -Oz -ffunction-sections -fdata-sections -flto -fno-rtti -fno-exceptions -fvisibility=hidden -fomit-frame-pointer
+LOCAL_CFLAGS := -Wall -Wextra -Oz -ffunction-sections -fdata-sections -flto -fvisibility=hidden -fomit-frame-pointer
+LOCAL_LDLIBS := -llog -landroid -static-libstdc++
+LOCAL_LDFLAGS := -Wl,--gc-sections -Wl,--strip-all -Wl,--strip-debug -Wl,--discard-all -flto -s
+LOCAL_CPPFLAGS += -DANDROID_NDK
+LOCAL_ARM_MODE := arm
+include $(BUILD_EXECUTABLE)

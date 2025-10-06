@@ -101,24 +101,40 @@ if %ERRORLEVEL% equ 0 (
         
         if !ERRORLEVEL! equ 0 (
             echo klaunch build successful!
-            
             REM 剥离符号以减小文件大小
             echo Stripping klaunch binary...
             "%STRIP%" klaunch.exe
             
-            REM 显示文件信息
-            echo Binary info:
-            dir kctrl.exe kfind.exe klaunch.exe
+            REM 编译opxiii
+            echo Compiling opxiii...
+            "%CXX%" %CXXFLAGS% -I"%ANDROID_NDK_ROOT%\sysroot\usr\include" -DANDROID_NDK -D__ANDROID_API__=%API_LEVEL% ..\opxiii.cpp -o opxiii.exe %LDFLAGS%
             
-            echo.
-            echo Binaries location: %CD%\
-            echo To deploy to Android device:
-            echo   adb push kctrl.exe /data/adb/modules/kctrl/kctrl
-            echo   adb push kfind.exe /data/adb/modules/kctrl/kfind
-            echo   adb push klaunch.exe /data/adb/modules/kctrl/klaunch
-            echo   adb shell chmod 755 /data/adb/modules/kctrl/kctrl
-            echo   adb shell chmod 755 /data/adb/modules/kctrl/kfind
-            echo   adb shell chmod 755 /data/adb/modules/kctrl/klaunch
+            if !ERRORLEVEL! equ 0 (
+                echo opxiii build successful!
+                REM 剥离符号以减小文件大小
+                echo Stripping opxiii binary...
+                "%STRIP%" opxiii.exe
+                
+                REM 显示文件信息
+                echo Binary info:
+                dir kctrl.exe kfind.exe klaunch.exe opxiii.exe
+                
+                echo.
+                echo Binaries location: %CD%\
+                echo To deploy to Android device:
+                echo   adb push kctrl.exe /data/adb/modules/kctrl/kctrl
+                echo   adb push kfind.exe /data/adb/modules/kctrl/kfind
+                echo   adb push klaunch.exe /data/adb/modules/kctrl/klaunch
+                echo   adb push opxiii.exe /data/adb/modules/kctrl/opxiii
+                echo   adb shell chmod 755 /data/adb/modules/kctrl/kctrl
+                echo   adb shell chmod 755 /data/adb/modules/kctrl/kfind
+                echo   adb shell chmod 755 /data/adb/modules/kctrl/klaunch
+                echo   adb shell chmod 755 /data/adb/modules/kctrl/opxiii
+            ) else (
+                echo opxiii build failed!
+                pause
+                exit /b 1
+            )
         ) else (
             echo klaunch build failed!
             pause
