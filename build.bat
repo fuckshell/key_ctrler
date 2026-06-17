@@ -71,7 +71,7 @@ if not exist "%CXX%" (
 
 REM 编译选项
 set CXXFLAGS=-std=c++17 -Wall -Wextra -O2 -fPIE
-set LDFLAGS=-pie -llog -landroid -lpthread
+set LDFLAGS=-pie -llog -landroid -lpthread -static-libc++
 
 REM 编译kctrl
 echo Compiling kctrl...

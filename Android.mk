@@ -10,7 +10,7 @@ LOCAL_CPPFLAGS := -std=c++17 -Wall -Wextra -Oz -ffunction-sections -fdata-sectio
 LOCAL_CFLAGS := -Wall -Wextra -Oz -ffunction-sections -fdata-sections -flto -fvisibility=hidden -fomit-frame-pointer
 
 # 链接库和极致优化标志
-LOCAL_LDLIBS := -llog -landroid -static-libstdc++
+LOCAL_LDLIBS := -llog -landroid -static-libc++
 LOCAL_LDFLAGS := -Wl,--gc-sections -Wl,--strip-all -Wl,--strip-debug -Wl,--discard-all -flto -s
 
 # 设置API级别
@@ -35,7 +35,7 @@ LOCAL_MODULE := opxiii
 LOCAL_SRC_FILES := opxiii.cpp
 LOCAL_CPPFLAGS := -std=c++17 -Wall -Wextra -Oz -ffunction-sections -fdata-sections -flto -fno-rtti -fno-exceptions -fvisibility=hidden -fomit-frame-pointer
 LOCAL_CFLAGS := -Wall -Wextra -Oz -ffunction-sections -fdata-sections -flto -fvisibility=hidden -fomit-frame-pointer
-LOCAL_LDLIBS := -llog -landroid -static-libstdc++
+LOCAL_LDLIBS := -llog -landroid -static-libc++
 LOCAL_LDFLAGS := -Wl,--gc-sections -Wl,--strip-all -Wl,--strip-debug -Wl,--discard-all -flto -s
 LOCAL_CPPFLAGS += -DANDROID_NDK
 LOCAL_ARM_MODE := arm

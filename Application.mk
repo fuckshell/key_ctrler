@@ -4,8 +4,8 @@ APP_PLATFORM := android-29
 # 设置目标架构
 APP_ABI := arm64-v8a armeabi-v7a x86_64 x86
 
-# 设置STL
-APP_STL := c++_shared
+# 设置STL（静态链接 libc++，避免运行时找不到 libc++_shared.so）
+APP_STL := c++_static
 
 # 设置优化级别
 APP_OPTIM := release

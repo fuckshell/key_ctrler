@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.18.1)
 
+# 强制静态链接 libc++（NDK r18+ 使用 c++_static，非 gnustl 的 -static-libstdc++）
+set(ANDROID_STL c++_static)
+
 project("kctrl")
 
 # 设置C++标准
@@ -22,13 +25,13 @@ find_library(android-lib android)
 target_link_libraries(kctrl
     ${log-lib}
     ${android-lib}
-    -static-libstdc++
+    -static-libc++
 )
 
 target_link_libraries(opxiii
     ${log-lib}
     ${android-lib}
-    -static-libstdc++
+    -static-libc++
 )
 
 # 设置目标属性

@@ -43,7 +43,7 @@ STRIP = $(TOOLCHAIN_DIR)/bin/llvm-strip
 CFLAGS = -Wall -Wextra -Oz -fPIE -ffunction-sections -fdata-sections -flto -fvisibility=hidden -fomit-frame-pointer
 CXXFLAGS = -std=c++17 -Wall -Wextra -Oz -fPIE -ffunction-sections -fdata-sections -flto -fno-rtti -fno-exceptions -fvisibility=hidden -fomit-frame-pointer
 CPPFLAGS = -I$(ANDROID_NDK_ROOT)/sysroot/usr/include -DANDROID_NDK -D__ANDROID_API__=$(API_LEVEL)
-LDFLAGS = -pie -llog -landroid -static-libstdc++ -Wl,--gc-sections -Wl,--strip-all -Wl,--strip-debug -Wl,--discard-all -flto -s
+LDFLAGS = -pie -llog -landroid -static-libc++ -Wl,--gc-sections -Wl,--strip-all -Wl,--strip-debug -Wl,--discard-all -flto -s
 
 # 源文件和目标文件
 SRCS = main.cpp

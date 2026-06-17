@@ -25,7 +25,7 @@ case "$(uname)" in
 esac
 
 CXXFLAGS="-std=c++17 -Os -fvisibility=hidden -fdata-sections -ffunction-sections -fno-rtti -DNDEBUG"
-LDFLAGS="-Os -Wl,--gc-sections -s -pie -llog -landroid -lz"
+LDFLAGS="-Os -Wl,--gc-sections -s -pie -llog -landroid -lz -static-libc++"
 
 declare -A ARCHS=( ["arm64-v8a"]="aarch64-linux-android 35"
                    ["armeabi-v7a"]="armv7a-linux-androideabi 35"
