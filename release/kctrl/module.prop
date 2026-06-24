@@ -1,0 +1,6 @@
+id=kctrl
+name=KCTRL Key Controller
+version=v2.6.6
+versionCode=266
+author=IDlike
+description=Android key event listener (arm64 static build)

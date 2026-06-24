@@ -1,418 +1,247 @@
-# KCTRL - Android按键控制器
+# KCTRL - Android 按键控制器（Magisk / KernelSU 模块）
 
-一个使用Android NDK 28为Android 15开发的二进制文件，用于监听设备按键事件并执行相应的shell脚本。
+监听物理按键（侧键、音量键等），按 **单击 / 双击 / 短按 / 长按** 触发 shell 脚本。
 
-相应APP在 https://github.com/txlweb/key_ctrler_APP
+配套管理 App：[key_ctrler_APP](https://github.com/txlweb/key_ctrler_APP)
 
-## 功能特性
+---
 
-- ✅ **单实例运行保护** - 防止多次运行，PID输出到 `./mpid.txt`
-- ✅ **WakeLock保活** - 使用系统级WakeLock确保锁屏状态下保持运行
-- ✅ **底层按键监听** - 直接监听 `/dev/input/eventX` 设备事件
-- ✅ **配置文件驱动** - 通过配置文件指定监听设备和对应脚本
-- ✅ **智能按键识别** - 支持单击/双击/短按/长按事件识别
-- ✅ **可配置时间阈值** - 所有时间参数可通过配置文件修改并即时生效
-- ✅ **多事件类型支持** - 区分click、double_click、short_press、long_press事件
-- ✅ **兼容性保持** - 保持对原有keydown/keyup事件的兼容
-- ✅ **脚本执行** - 触发事件时异步执行对应的shell脚本
-- ✅ **多架构支持** - 支持 arm64-v8a, armeabi-v7a, x86_64, x86
+## 测试环境（作者实机）
 
-## 项目结构
+本模块当前主要在以下环境完成侧键功能验证：
 
-```
-KCTRL_CPP/
-├── main.cpp              # 主程序源代码
-├── CMakeLists.txt         # CMake构建配置
-├── Android.mk             # NDK构建配置
-├── Application.mk         # NDK应用配置
-├── config.txt             # 配置文件示例
-├── build.sh               # Linux/macOS构建脚本
-├── build.bat              # Windows构建脚本
-├── deploy.sh              # Linux/macOS部署脚本
-├── deploy.bat             # Windows部署脚本
-├── scripts/               # 示例脚本目录
-│   ├── power_key.sh       # 电源键脚本
-│   ├── volume_up.sh       # 音量加键脚本
-│   ├── volume_down.sh     # 音量减键脚本
-│   ├── home_key.sh        # Home键脚本
-│   └── back_key.sh        # 返回键脚本
-└── README.md              # 项目说明文档
-```
+| 项目 | 说明 |
+|------|------|
+| 机型 | **一加 13T** |
+| 系统 | **ColorOS 16.0.7**（Android 15 / 16 类 ROM） |
+| Root | **KernelSU（KSU）** |
+| 架构 | **arm64-v8a** |
+| 机型系列 | 一加 13T（OPPO/一加侧键走 `gpio-keys` 输入设备） |
+| 侧键码 | **KEY 735**（日志里可见 `Key pressed: 735`） |
+| 配套 App | `com.idlike.kctrl.mgr` |
 
-## 环境要求
+> Magisk / APatch 理论上也可安装本 zip，但 **ColorOS 16 + KSU** 是作者实际调试路径；若你用的不是这套组合，请先按下方「OPPO / 一加侧键」章节核对设备与脚本写法。
 
-### 开发环境
-- Android NDK r28 或更高版本
-- CMake 3.18.1 或更高版本
-- Android SDK Platform Tools (包含adb)
+### ColorOS 16 + KSU 特别注意
 
-### 目标设备
-- Android 15 (API Level 35) 或更高版本
-- Root权限（用于访问输入设备和WakeLock）
+1. **模块安装**：KernelSU → 模块 → 从本地安装 `kctrl_module.zip` → 重启。
+2. **脚本执行**：KSU 下侧键脚本由 `script_daemon` 经 `runcon u:r:shell:s0` 执行，**脚本内禁止 `su -c`**（见下文专节）。
+3. **SELinux**：脚本从 `/data/adb/modules/kctrl/scripts/` 复制到 `/data/local/tmp` 再执行；不要指望在 shell 域直接读 modules 目录。
+4. **更新模块**：改二进制后需 `killall kctrl` 再覆盖，或运行 `update_all.sh`，否则可能出现 `Text file busy`、仍跑旧版 kctrl。
+5. **App 测试 vs 侧键**：App 里「测试脚本」走 root shell；侧键走 daemon + shell 域——**两者不是同一条路径**，以 Termux 下 `runcon u:r:shell:s0 sh 脚本` 为准。
 
-## 构建说明
+### OPPO / 一加侧键（KEY 735）
 
-### 1. 设置环境变量
-
-**Linux/macOS:**
-```bash
-export ANDROID_NDK_ROOT=/path/to/android-ndk-r28
-```
-
-**Windows:**
-```cmd
-set ANDROID_NDK_ROOT=C:\path\to\android-ndk-r28
-```
-
-### 2. 编译二进制文件
-
-**Linux/macOS:**
-```bash
-# 默认编译arm64-v8a架构
-./build.sh
-
-# 编译特定架构
-./build.sh armeabi-v7a
-./build.sh x86_64
-./build.sh x86
-```
-
-**Windows:**
-```cmd
-REM 默认编译arm64-v8a架构
-build.bat
-
-REM 编译特定架构
-build.bat armeabi-v7a
-build.bat x86_64
-build.bat x86
-```
-
-编译完成后会生成两个可执行文件：
-- `kctrl`: 主程序，用于监听按键事件并执行相应脚本
-- `kfind`: 按键检测工具，用于查找按键码
-
-
-## 配置文件说明
-
-配置文件 `config.txt` 格式如下：
-
-```
-# 输入设备路径
-input_device=/dev/input/event2
-
-# 时间阈值配置 (单位: 毫秒)
-# 0-500ms视为按键点击
-click_threshold=500
-# 小于1000ms认为是短按
-short_press_threshold=1000
-# 大于2000ms认为是长按
-long_press_threshold=2000
-# 双击间隔时间
-double_click_interval=300
-
-# 按键事件对应的脚本路径
-# 格式: 按键码_事件类型=脚本路径
-# 事件类型支持:
-#   - keydown: 按键按下 (兼容模式)
-#   - keyup: 按键抬起 (兼容模式)
-#   - click: 单击 (0-500ms)
-#   - double_click: 双击 (两次点击间隔<300ms)
-#   - short_press: 短按 (500ms-1000ms)
-#   - long_press: 长按 (>2000ms)
-
-# 电源键 (116)
-116_keydown=./scripts/power_down.sh
-116_keyup=./scripts/power_up.sh
-116_click=./scripts/power_click.sh
-116_double_click=./scripts/power_double.sh
-116_short_press=./scripts/power_short.sh
-116_long_press=./scripts/power_long.sh
-
-# 音量减键 (114)
-114_keydown=./scripts/volume_down.sh
-114_click=./scripts/volume_down_click.sh
-114_long_press=./scripts/volume_down_long.sh
-
-# 音量加键 (115)
-115_keydown=./scripts/volume_up.sh
-115_click=./scripts/volume_up_click.sh
-115_long_press=./scripts/volume_up_long.sh
-
-# Home键 (102)
-102_keydown=./scripts/home_down.sh
-102_double_click=./scripts/home_double.sh
-
-# 返回键 (158)
-158_keydown=./scripts/back_down.sh
-158_long_press=./scripts/back_long.sh
-```
-
-### 常见按键代码
-
-| 按键 | 代码 | 说明 |
-|------|------|------|
-| 电源键 | 116 | KEY_POWER |
-| 音量减 | 114 | KEY_VOLUMEDOWN |
-| 音量加 | 115 | KEY_VOLUMEUP |
-| Home键 | 102 | KEY_HOME |
-| 返回键 | 158 | KEY_BACK |
-| 菜单键 | 139 | KEY_MENU |
-
-### 查找输入设备
-
-在Android设备上执行以下命令查找可用的输入设备：
-
-```bash
-# 列出所有输入设备
-ls -la /dev/input/
-
-# 查看设备信息
-cat /proc/bus/input/devices
-
-# 实时监听设备事件（测试用）
-getevent /dev/input/event0
-```
-
-## 按键事件识别说明
-
-### 事件类型定义
-
-- **click (单击)**: 按键持续时间 0-500ms
-- **double_click (双击)**: 两次单击间隔小于300ms
-- **short_press (短按)**: 按键持续时间 500ms-1000ms  
-- **long_press (长按)**: 按键持续时间大于2000ms
-- **keydown/keyup**: 兼容模式，保持原有按下/抬起事件
-
-### 时间阈值配置
-
-所有时间参数都可以通过配置文件修改并即时生效：
+ColorOS 上侧键通常挂在 **gpio-keys**，对应 `/dev/input/event0` 或 `event1`。默认配置使用设备名匹配：
 
 ```ini
-click_threshold=500        # 单击阈值 (ms)
-short_press_threshold=1000 # 短按阈值 (ms)
-long_press_threshold=2000  # 长按阈值 (ms)
-double_click_interval=300  # 双击间隔 (ms)
+device=gpio-keys
 ```
 
-### 事件触发逻辑
-
-1. 按键按下时启动计时
-2. 按键释放时根据持续时间判断事件类型
-3. 单击事件会等待双击间隔时间，确认是否为双击
-4. 长按事件在达到阈值时立即触发
-5. 所有事件都会传递事件类型参数给脚本
-
-## 使用方法
-
-### 1. 基本运行
+用 kfind 确认按键码：
 
 ```bash
-# 连接到设备
-adb shell
-
-# 切换到程序目录
-cd /data/adb/modules/kctrl
-
-# 获取root权限
-su
-
-# 运行程序（使用默认配置）
-./kctrl
-
-# 使用自定义配置文件
-./kctrl /path/to/custom/config.txt
+/data/adb/modules/kctrl/kfind
+# 按侧键，应看到 code 735
 ```
 
-### 1.1 按键检测工具 (kfind)
+日志正常时类似：
 
-用于查找按键码，帮助配置 `config.txt` 文件：
-
-```bash
-# 运行按键检测
-cd /data/adb/modules/kctrl
-./kfind
+```
+Key pressed: 735
+Key released: 735 (duration: 170ms)    # 单击
+[script_daemon] exec ... event=click
+Starting service: Intent { ... }       # am 真正执行成功
 ```
 
-- 按下你想要检测的按键，程序会显示按键码
-- 使用 Ctrl+C 退出程序
-- 将检测到的按键码添加到 `config.txt` 中
+---
 
-### 2. 后台运行
+## 快速安装
 
-```bash
-# 后台运行
-nohup ./kctrl > /dev/null 2>&1 &
+1. 下载 [Releases](https://github.com/fuckshell/key_ctrler/releases) 中的 `kctrl_module.zip`（或自行打包，见下文）
+2. 在 **KernelSU**（推荐，作者环境）或 Magisk / APatch 中安装模块并重启
+3. 安装配套 App，在 App 里配置 KEY 735 与脚本
+4. 重启后模块自动运行，日志：`/data/adb/modules/kctrl/klog.log`
 
-# 查看运行状态
-ps | grep kctrl
+模块安装路径：`/data/adb/modules/kctrl/`
 
-# 停止程序
-killall kctrl
+---
+
+## ⚠️ 脚本里不要写 `su -c`（必读）
+
+侧键脚本由模块内的 `script_daemon` 执行，流程是：
+
+```
+kctrl 检测按键 → 写入 job 文件 → script_daemon
+  → 复制脚本到 /data/local/tmp
+  → runcon u:r:shell:s0 sh 脚本.sh 事件类型
 ```
 
-### 3. 查看日志
+脚本已经在 **shell 域** 里运行，可以直接调用 `am`、`cmd`、`input` 等，**不要再套一层 `su -c`**。
 
-```bash
-# 查看系统日志
-logcat | grep KCTRL
-
-# 查看脚本执行日志
-tail -f /data/adb/modules/kctrl/kctrl.log
-```
-
-## 脚本开发
-
-脚本接收一个参数：事件类型（`keydown` 或 `keyup`）
-
-### 脚本模板
+### ❌ 错误写法
 
 ```bash
 #!/bin/bash
-
-EVENT_TYPE=$1
-LOG_FILE="/data/adb/modules/kctrl/kctrl.log"
-TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
-
-echo "[$TIMESTAMP] Key event: $EVENT_TYPE" >> $LOG_FILE
-
-case $EVENT_TYPE in
-    "keydown")
-        # 按键按下时的操作
-        echo "Key pressed" >> $LOG_FILE
-        # 在这里添加你的代码
-        ;;
-    "keyup")
-        # 按键抬起时的操作
-        echo "Key released" >> $LOG_FILE
-        # 在这里添加你的代码
-        ;;
-esac
-
-exit 0
+su -c "am start -n com.tencent.mm/.plugin.offline.ui.WalletOfflineEntranceUI"
 ```
 
-## 权限要求
+在 KernelSU / ColorOS 16 上常见现象：脚本“执行了”但 `am` 没真正跑起来（`Failed transaction`、无 `Starting service` 日志）。
 
-程序需要以下权限：
-
-1. **Root权限** - 访问系统级功能
-2. **读取输入设备** - 访问 `/dev/input/eventX`
-3. **WakeLock权限** - 访问 `/sys/power/wake_lock`
-4. **文件系统权限** - 创建PID文件和日志文件
-
-### 调试方法
+### ✅ 正确写法
 
 ```bash
-# 查看程序日志
-logcat | grep KCTRL
-
-# 测试输入设备
-getevent /dev/input/event0
-
-# 检查进程状态
-ps | grep kctrl
-
-# 查看PID文件
-cat ./mpid.txt
+#!/bin/bash
+am start -n com.tencent.mm/.plugin.offline.ui.WalletOfflineEntranceUI
 ```
 
-### 常见错误及解决方法
+手电、微信付款码、启动 Activity 等，一律 **直接写 `am` / `cmd` / `input`**。
 
-#### 1. "Invalid argument" (EINVAL) 错误
+### 如何检查现有脚本
 
-**问题描述**: 程序启动时出现"Invalid argument"或"无效的参数"错误
-
-**可能原因**:
-- 设备路径不正确
-- 设备不是有效的输入设备
-- 设备权限不足
-
-**解决方法**:
-
-1. **使用诊断工具**:
 ```bash
-# 在设备上运行诊断脚本
-adb shell
-su
-cd /data/adb/modules/kctrl
-./diagnose.sh
+grep -r 'su -c' /data/adb/modules/kctrl/scripts/
+cat /data/adb/modules/kctrl/scripts/short_press_735.sh
 ```
 
-2. **手动检查设备**:
+在 App 脚本编辑器里删掉 `su -c "..."` 外壳，只保留里面的命令，保存即可。
+
+### 手动验证（与侧键同路径）
+
 ```bash
-# 检查设备是否存在且有效
-ls -la /dev/input/event*
-
-# 验证设备类型
-file /dev/input/event0
-
-# 测试设备是否可读
-cat /dev/input/event0 > /dev/null &
-# 按Ctrl+C退出测试
+cp /data/adb/modules/kctrl/scripts/click_735.sh /data/local/tmp/t.sh
+runcon u:r:shell:s0 /system/bin/sh /data/local/tmp/t.sh click
 ```
 
-3. **使用正确的设备路径**:
-```bash
-# 查看可用的输入设备
-cat /proc/bus/input/devices | grep -E "^N:|^H:"
+若这里能成功，侧键也应能成功。
 
-# 使用getevent测试设备
-getevent -l /dev/input/event0
-```
+---
 
-4. **更新配置文件**:
-确保`config.txt`中的设备路径正确:
+## 四种按键事件
+
+| 事件 | 触发方式 | 默认阈值 |
+|------|----------|----------|
+| `click` | 快速点按 | 按下 ≤ 500ms |
+| `double_click` | 300ms 内连点两下 | 同上 |
+| `short_press` | 按住再松 | 500ms ~ 1000ms |
+| `long_press` | 长按再松 | ≥ 2000ms |
+
+1000ms ~ 2000ms 之间为**死区**，不触发任何事件。
+
+`config.txt` 示例（KEY 735 侧键）：
+
 ```ini
-# 使用正确的设备路径
-devices=/dev/input/event2,/dev/input/event3
+device=gpio-keys
+click_threshold=500
+short_press_threshold=1000
+long_press_threshold=2000
+double_click_interval=300
+
+script_735_click=click_735.sh
+script_735_double_click=double_click_735.sh
+script_735_short_press=short_press_735.sh
+script_735_long_press=long_press_735.sh
 ```
 
-#### 2. "Permission denied" (EACCES) 错误
+脚本放在 `scripts/` 目录，配置里只写**文件名**。
 
-**解决方法**:
+---
+
+## 模块目录结构
+
+```
+release/kctrl/
+├── module.prop
+├── service.sh
+├── script_daemon.sh
+├── kctrl
+├── kfind
+├── config.txt
+├── scripts/
+├── update_all.sh
+└── patch_daemon.sh
+```
+
+---
+
+## 从源码构建
+
 ```bash
-# 确保以root权限运行
-adb shell
-su
-cd /data/adb/modules/kctrl
-./kctrl
+export ANDROID_NDK_ROOT=~/android-ndk-r26d
+./build.sh arm64-v8a
+cp build/lib64_v8a/kctrl release/kctrl/
+./release/pack_module.sh   # → release/kctrl_module.zip
 ```
 
-#### 3. "No such file or directory" (ENOENT) 错误
+---
 
-**解决方法**:
+## 上传到 GitHub（维护者）
+
+### 1. 准备
+
 ```bash
-# 检查设备是否存在
-ls -la /dev/input/event*
-
-# 如果设备不存在，可能需要重新插拔设备或重启
+./build.sh arm64-v8a
+cp build/lib64_v8a/kctrl release/kctrl/
+./release/pack_module.sh
 ```
 
-### 故障排除工具
+### 2. 提交并推送
 
-项目提供了专门的诊断工具来帮助解决问题：
-
-- **diagnose.sh**: Android shell脚本，用于设备诊断
-- **diagnose.bat**: Windows批处理脚本，通过ADB诊断设备
-
-使用方法：
 ```bash
-# Android设备上运行
-./diagnose.sh
-
-# Windows上通过ADB运行
-diagnose.bat
+git add kctrl.cpp build.sh release/ .gitignore README.md
+git commit -m "release: kctrl v2.6.6 Magisk module"
+git push origin master
 ```
 
-## 作者
+### 3. 创建 Release
 
-**IDlike** - 项目作者和维护者
+仓库 → **Releases** → 新建 tag `v2.6.6`，上传 `release/kctrl_module.zip`。
 
-## 贡献
+```bash
+gh release create v2.6.6 release/kctrl_module.zip \
+  --title "v2.6.6" \
+  --notes "在 ColorOS 16.0.7 + KernelSU 上验证侧键脚本执行。脚本内请勿使用 su -c，详见 README。"
+```
 
-欢迎提交Issue和Pull Request来改进这个项目。
+### 4. 换到自己的仓库
+
+```bash
+git remote set-url origin https://github.com/你的用户名/key_ctrler.git
+git push -u origin master
+```
+
+---
+
+## 更新已安装模块
+
+- 在 Magisk / KernelSU 里重装 zip，或
+- 拷新 `kctrl` 到 `/sdcard/Download/kctrl` 后执行：`sh /data/adb/modules/kctrl/update_all.sh`
+
+---
+
+## 调试
+
+```bash
+tail -f /data/adb/modules/kctrl/klog.log
+grep script_daemon /data/adb/modules/kctrl/klog.log | tail -20
+/data/adb/modules/kctrl/kfind
+```
+
+---
+
+## 常见问题
+
+| 现象 | 处理 |
+|------|------|
+| ColorOS 侧键无反应 | 确认 KSU 模块已启用；`device=gpio-keys`；kfind 看是否 735 |
+| 短按/长按无效 | 按住 0.5~1s / ≥2s；App 里配置并保存对应脚本 |
+| 脚本含 `su -c` | 改成直接 `am ...`（ColorOS 16 + KSU 必改） |
+| App 测试成功、侧键失败 | 侧键走 runcon shell，按 README 用 Termux 验证 |
+| `No script configured` | App 保存配置或编辑 config.txt |
+| 只更新了 daemon 没更新 kctrl | 运行 `update_all.sh` |
+
+---
 
 ## 免责声明
 
-本工具仅供学习和研究使用，使用者需要自行承担使用风险。请确保在合法合规的前提下使用本工具。
+仅供学习研究，请合法合规使用，自行承担风险。

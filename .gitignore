@@ -1,0 +1,5 @@
+build/
+*.o
+*.zip
+.DS_Store
+*.swp

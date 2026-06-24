@@ -1,3 +1,4 @@
+#include <sstream>
 // 最小化头文件包含以减少内存占用
 #include <unistd.h>
 #include <fcntl.h>
@@ -36,6 +37,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <iostream>
 
 #define LOG_TAG "KCTRL"
@@ -337,11 +339,15 @@ bool load_config(const char* config_file) {
         strncpy(key_buffer, line_buffer, key_len);
         key_buffer[key_len] = '\0';
         
-        // 移除值末尾的换行符
+        // 移除值末尾换行及 Windows \r
         char* value_start = eq_pos + 1;
         size_t value_len = strlen(value_start);
-        if (value_len > 0 && value_start[value_len - 1] == '\n') {
-            value_start[value_len - 1] = '\0';
+        while (value_len > 0 && (value_start[value_len - 1] == '\n' || value_start[value_len - 1] == '\r')) {
+            value_start[--value_len] = '\0';
+        }
+        // trim key trailing spaces / \r
+        while (key_len > 0 && (key_buffer[key_len - 1] == ' ' || key_buffer[key_len - 1] == '\r' || key_buffer[key_len - 1] == '\t')) {
+            key_buffer[--key_len] = '\0';
         }
         
         strncpy(value_buffer, value_start, sizeof(value_buffer) - 1);
@@ -538,24 +544,77 @@ static std::vector<std::string> resolve_device_config(const std::string& devices
     return resolved;
 }
 
-// 执行shell脚本 - 内存优化版本
-void execute_script(const std::string& script_name, const std::string& event_type) {
-    // 使用静态缓冲区避免动态分配
-    static char command_buffer[512];
-    
-    // 直接构建命令字符串
-    snprintf(command_buffer, sizeof(command_buffer), 
-             "sh /data/adb/modules/kctrl/scripts/%s %s", 
-             script_name.c_str(), event_type.c_str());
-    
-    LOGI("Executing: %s", command_buffer);
-    
-    int result = system(command_buffer);
-    if (result == -1) {
-        LOGE("Failed to execute script: %s", strerror(errno));
-    } else {
-        LOGI("Script executed with result: %d", result);
+// 经 FIFO 交给 script_daemon.sh 执行（与 Termux root sh 同域，am/cmd 可用）
+// kctrl 二进制 fork 出的 sh 调 Binder 会 Failed transaction，故默认走 daemon
+static void execute_script_direct(const char* script_path, const char* event_type) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        LOGE("fork failed: %s", strerror(errno));
+        return;
     }
+    if (pid == 0) {
+        setsid();
+        int nullfd = open("/dev/null", O_RDWR);
+        if (nullfd >= 0) {
+            dup2(nullfd, STDIN_FILENO);
+            if (nullfd > STDERR_FILENO) close(nullfd);
+        }
+        int logfd = open(LOG_FILE, O_WRONLY | O_APPEND | O_CREAT, 0644);
+        if (logfd >= 0) {
+            dup2(logfd, STDOUT_FILENO);
+            dup2(logfd, STDERR_FILENO);
+            if (logfd > STDERR_FILENO) close(logfd);
+        }
+        setenv("PATH", "/system/bin:/system/xbin:/vendor/bin:/product/bin:/system_ext/bin", 1);
+        static char cmdline[768];
+        snprintf(cmdline, sizeof(cmdline), "/system/bin/sh '%s' '%s'", script_path, event_type);
+        execl("/system/bin/sh", "sh", "-c", cmdline, (char*)NULL);
+        _exit(127);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        LOGE("waitpid failed: %s", strerror(errno));
+        return;
+    }
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        LOGI("Script executed OK (direct): %s", script_path);
+    } else {
+        LOGE("Script failed (direct): %s exit=%d", script_path,
+             WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    }
+}
+
+void execute_script(const std::string& script_spec, const std::string& event_type) {
+    static char script_path[512];
+    if (!script_spec.empty() && script_spec[0] == '/') {
+        snprintf(script_path, sizeof(script_path), "%s", script_spec.c_str());
+    } else if (script_spec.find('/') != std::string::npos) {
+        snprintf(script_path, sizeof(script_path), "/data/adb/modules/kctrl/%s", script_spec.c_str());
+    } else {
+        snprintf(script_path, sizeof(script_path), "/data/adb/modules/kctrl/scripts/%s", script_spec.c_str());
+    }
+
+    LOGI("Executing script: %s event=%s", script_path, event_type.c_str());
+
+    static const char* job = "/data/local/tmp/kctrl_exec.job";
+    static const char* job_tmp = "/data/local/tmp/kctrl_exec.job.tmp";
+    FILE* jf = fopen(job_tmp, "w");
+    if (jf) {
+        fprintf(jf, "%s\n%s\n", script_path, event_type.c_str());
+        fclose(jf);
+        chmod(job_tmp, 0666);
+        if (rename(job_tmp, job) == 0) {
+            LOGI("Script queued to daemon (job): %s", script_path);
+            return;
+        }
+        unlink(job_tmp);
+        LOGW("job rename failed, fallback to direct exec");
+    } else {
+        LOGW("job write failed, fallback to direct exec");
+    }
+
+    execute_script_direct(script_path, event_type.c_str());
 }
 
 // 处理按键事件类型识别 - 内存优化版本
@@ -588,9 +647,9 @@ void handle_key_event_type(int keycode, const std::string& event_type, int durat
     
     auto it = g_config.find(script_key_buffer);
     if (it != g_config.end()) {
-        // 移除文件日志记录，直接执行脚本
-        std::thread script_thread(execute_script, it->second, event_type);
-        script_thread.detach();
+        execute_script(it->second, event_type);
+    } else {
+        LOGW("No script configured for %s", script_key_buffer);
     }
 }
 
@@ -625,16 +684,18 @@ void double_click_timer(int keycode) {
 }
 
 // 处理按键释放后的事件判断定时器 - 内存优化版本
+// click: duration <= click_threshold (双击在 double_click_timer)
+// short_press: click_threshold < duration < short_press_threshold
+// long_press: duration >= long_press_threshold
+// short_press_threshold ~ long_press_threshold 之间不触发（与 README/api 一致）
 void key_release_timer(int keycode, long long duration) {
-    // 直接处理事件，无需锁定状态
     if (duration >= g_long_press_threshold) {
-        // 长按事件
         handle_key_event_type(keycode, "long_press", duration);
-    } else if (duration > g_click_threshold) {
-        // 短按事件
+    } else if (duration > g_click_threshold && duration < g_short_press_threshold) {
         handle_key_event_type(keycode, "short_press", duration);
+    } else {
+        LOGI("Key %d release %lldms: no short/long (dead zone or too short)", keycode, duration);
     }
-    // 点击事件在双击检测定时器中处理
 }
 
 // 监听输入设备事件
@@ -879,7 +940,7 @@ void cleanup() {
 }
 
 int main(int argc, char* argv[]) {
-    LOGI("KCTRL v2.4 starting...");
+    LOGI("KCTRL v2.6.6 starting (script via job file + daemon)");
     LOGI("Author: IDlike");
     LOGI("Description: 适用于Android15+的按键控制模块");
     

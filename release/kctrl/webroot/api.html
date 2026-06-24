@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>KCtrl API</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      overflow-x: hidden;
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      background: transparent;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    canvas {
+      position: fixed;
+      top: 0;
+      left: 0;
+      z-index: -2;
+    }
+
+    .wiki-container {
+      background: rgba(255,255,255,0.15);
+      backdrop-filter: blur(15px);
+      -webkit-backdrop-filter: blur(15px);
+      border-radius: 20px;
+      padding: 40px 60px;
+      margin: 40px;
+      max-width: 1000px;
+      color: #ffffff;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+      border: 1px solid rgba(255,255,255,0.2);
+      line-height: 1.6;
+    }
+
+    h1, h2, h3 {
+      text-align: center;
+      margin-bottom: 20px;
+      text-shadow: 0 2px 4px rgba(0,0,0,0.5);
+    }
+
+    h2 {
+      margin-top: 30px;
+    }
+
+    p {
+      margin: 8px 0;
+      text-shadow: 0 1px 2px rgba(0,0,0,0.4);
+    }
+
+    pre {
+      background: rgba(0,0,0,0.25);
+      padding: 15px;
+      border-radius: 10px;
+      overflow-x: auto;
+      color: #00c4ff;
+      font-size: 0.95em;
+      text-shadow: none;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 15px 0;
+    }
+
+    th, td {
+      border: 1px solid rgba(255,255,255,0.3);
+      padding: 8px;
+      text-align: left;
+      font-size: 0.95em;
+    }
+
+    th {
+      background: rgba(255,255,255,0.2);
+    }
+
+    .by-info {
+      position: fixed;
+      bottom: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 0.9em;
+      display: flex;
+    }
+
+    .by-info span {
+      display: inline-block;
+      text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+    }
+  </style>
+</head>
+<body>
+<canvas id="waveCanvas"></canvas>
+
+<div class="wiki-container">
+  <h1>KCtrl API </h1>
+
+  <h2>概述</h2>
+  <p>KCtrl API 是一个基于标准 Linux 的输入设备监听软件，用于实时捕获和处理标准输入设备事件，并根据配置执行对应操作。支持自动化快捷键管理、触发脚本，可广泛用于手机/手表等按键自定义操作场景。</p>
+
+  <h2>主要功能</h2>
+  <ul>
+    <li><b>输入设备监听：</b>支持单个或多个设备路径，捕获按键、点击、长按、双击事件。</li>
+    <li><b>脚本执行：</b>可为每个按键事件配置独立脚本，实现自定义逻辑。</li>
+    <li><b>CPU 亲和性：</b>指定程序运行核心，提高性能并避免干扰其他任务。</li>
+    <li><b>时间阈值：</b>灵活设置点击、短按、长按及双击时间。</li>
+    <li><b>日志管理：</b>可开启或关闭日志，方便调试和监控操作。</li>
+    <li><b>情景模式与系统控制：</b>支持响铃、震动、静音、勿扰等系统模式控制。</li>
+    <li><b>与常用 App 联动：</b>可通过 shell 指令控制微信、支付宝、音乐、拍照、录屏等应用。</li>
+  </ul>
+
+  <h2>配置文件示例</h2>
+  <pre>
+# KCTRL 配置文件
+# 格式: key=value
+# 以#开头的行为注释
+
+device=/dev/input/event0
+cpu_affinity=0
+click_threshold=200
+short_press_threshold=1000
+long_press_threshold=2000
+double_click_interval=300
+enable_log=0
+
+# KEY735 按键脚本
+script_735_click=key735_click.sh
+script_735_double_click=key735_double.sh
+script_735_short_press=key735_short.sh
+script_735_long_press=key735_long.sh
+    </pre>
+
+  <h3>已弃用 API</h3>
+  <p>早期版本支持 <code>name</code> 参数来指定设备名称以便日志显示，但该 API 已被弃用，不建议使用。现代配置仅需设备路径和事件脚本即可完成所有操作。</p>
+  <pre>
+# 过时示例
+name=Power Button
+    </pre>
+
+  <h2>KCtrl 控制器提供的内建指令参考</h2>
+  <p>KCtrl API内建的系统控制指令，你可以在下面找到：</p>
+
+  <table>
+    <thead>
+    <tr>
+      <th>功能类别</th>
+      <th>描述 / 示例命令</th>
+    </tr>
+    </thead>
+    <tbody>
+    <tr><td>获取铃声模式</td><td>am start-foreground-service -n com.idlike.kctrl.mgr/.NoteModeGetter &amp;&amp; sleep 0.3 &amp;&amp; mode=$(cat /sdcard/Android/data/com.idlike.kctrl.mgr/files/mode.txt) &amp;&amp; echo "$mode"</td></tr>
+    <tr><td>响铃？</td><td>test "$mode" = "响铃"</td></tr>
+    <tr><td>震动？</td><td>test "$mode" = "震动"</td></tr>
+    <tr><td>静音/勿扰？</td><td>test "$mode" = "静音"</td></tr>
+    <tr><td>手电开关</td><td>am start-foreground-service -n com.idlike.kctrl.mgr/.TorchToggleService</td></tr>
+    <tr><td>震动</td><td>am startservice -n com.idlike.kctrl.mgr/.VibrationService --el time 500</td></tr>
+    <tr><td>播放音效</td><td>am start-foreground-service -n com.idlike.kctrl.mgr/.AudioService</td></tr>
+    <tr><td>仿灵动岛</td><td>am startservice -n com.idlike.kctrl.mgr/com.idlike.kctrl.mgr.FloatingWindowService -a action_show --es extra_text "仿灵动岛" --ei extra_icon_id 2131165313</td></tr>
+    </tbody>
+  </table>
+
+
+  <h2>使用建议</h2>
+  <ul>
+    <li>尽量避免使用已弃用的 <code>name</code> 参数，现代版本无需指定设备名称。</li>
+    <li>在配置 CPU 亲和性时，根据设备核心数量合理分配，防止性能浪费或干扰系统任务。</li>
+    <li>脚本执行路径建议使用绝对路径或存放在固定目录，确保事件触发时可被正确调用。</li>
+    <li>常用 App 指令可结合逻辑控制类命令，实现自动化场景，如音乐控制、通知模式切换等。</li>
+    <li>建议开启日志调试初期配置，以便确认事件是否被正确捕获和执行。</li>
+  </ul>
+
+</div>
+
+<div class="by-info" id="byInfo"><span>By. IDlike</span></div>
+
+<script>
+  const canvas = document.getElementById('waveCanvas');
+  const ctx = canvas.getContext('2d');
+  let width = canvas.width = window.innerWidth;
+  let height = canvas.height = window.innerHeight;
+
+  const waves = [
+    {y: height/2, amplitude: 50, wavelength: 200, speed: 0.02, phase: 0, color: 'rgba(0,255,255,0.3)'},
+    {y: height/2 + 20, amplitude: 30, wavelength: 150, speed: 0.015, phase: 0, color: 'rgba(0,150,255,0.3)'}
+  ];
+
+  function drawWaves(){
+    ctx.clearRect(0,0,width,height);
+
+    // 渐变背景
+    const gradient = ctx.createLinearGradient(0,0,0,height);
+    gradient.addColorStop(0,'rgba(111,195,255,0.3)');
+    gradient.addColorStop(1,'rgba(10,28,59,0.6)');
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0,0,width,height);
+
+    // 波浪
+    waves.forEach(wave => {
+      ctx.beginPath();
+      ctx.moveTo(0, wave.y);
+      for(let x=0;x<=width;x+=1){
+        let y = wave.y + Math.sin((x/wave.wavelength)+wave.phase)*wave.amplitude;
+        ctx.lineTo(x, y);
+      }
+      ctx.lineTo(width,height);
+      ctx.lineTo(0,height);
+      ctx.closePath();
+      ctx.fillStyle = wave.color;
+      ctx.fill();
+      wave.phase += wave.speed;
+    });
+
+    requestAnimationFrame(drawWaves);
+  }
+
+  drawWaves();
+
+  window.addEventListener('resize',()=>{
+    width = canvas.width = window.innerWidth;
+    height = canvas.height = window.innerHeight;
+  });
+</script>
+</body>
+</html>

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # KCTRL 构建脚本 - 优化体积版
-export ANDROID_NDK_ROOT=~/android-ndk-r27d
+export ANDROID_NDK_ROOT=~/android-ndk-r26d
 set -e
 
 [ -z "$ANDROID_NDK_ROOT" ] && { echo "Error: ANDROID_NDK_ROOT not set"; exit 1; }
@@ -25,12 +25,12 @@ case "$(uname)" in
 esac
 
 CXXFLAGS="-std=c++17 -Os -fvisibility=hidden -fdata-sections -ffunction-sections -fno-rtti -DNDEBUG"
-LDFLAGS="-Os -Wl,--gc-sections -s -pie -llog -landroid -lz -static-libc++"
+LDFLAGS="-Os -Wl,--gc-sections -s -pie -llog -landroid -lz -static-libstdc++"
 
-declare -A ARCHS=( ["arm64-v8a"]="aarch64-linux-android 35"
-                   ["armeabi-v7a"]="armv7a-linux-androideabi 35"
-                   ["x86_64"]="x86_64-linux-android 35"
-                   ["x86"]="i686-linux-android 35" )
+declare -A ARCHS=( ["arm64-v8a"]="aarch64-linux-android 34"
+                   ["armeabi-v7a"]="armv7a-linux-androideabi 34"
+                   ["x86_64"]="x86_64-linux-android 34"
+                   ["x86"]="i686-linux-android 34" )
 
 compile_binary() {
     local src=$1 arch=$2
@@ -57,7 +57,7 @@ compile_for_arch() {
     local outdir=$([[ "$arch" == "armeabi-v7a" || "$arch" == "x86" ]] && echo "$LIB32_DIR" || echo "$LIB64_DIR")
     mkdir -p "$outdir"
 
-    for src in kctrl.cpp kfind.cpp klaunch.cpp opxiii.cpp bugdump.cpp scenexec.cpp; do
+    for src in kctrl.cpp kfind.cpp klaunch.cpp bugdump.cpp scenexec.cpp; do
         compile_binary "$src" "$arch" "$outdir" "$cxx" "$strip" "$api"
     done
 }
