@@ -3,3 +3,9 @@ build/
 *.zip
 .DS_Store
 *.swp
+scripts/gemini-api.env
+scripts/wechat-image-key.env
+scripts/wechat-calendar.env
+scripts/wechat-dashboard.env
+vendor/WeChat-Hook/
+.venv-voice/

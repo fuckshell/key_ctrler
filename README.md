@@ -1,3 +1,10 @@
+# 当前微信 / Phone AI 维护入口
+
+微信与 Phone AI 的现行流程、模型路由、状态和自修复验收请先读 [WECHAT_PIPELINE.md](WECHAT_PIPELINE.md)（持续更新，含流程图和2026-11-11实际验收）。
+[WECHAT_PC.md](WECHAT_PC.md) 是微信部署索引。以下是原 KCTRL 安卓按键模块说明，与当前微信模型/调度策略无关。
+
+---
+
 # KCTRL - Android 按键控制器（Magisk / KernelSU 模块）
 
 监听物理按键（侧键、音量键等），按 **单击 / 双击 / 短按 / 长按** 触发 shell 脚本。

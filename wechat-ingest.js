@@ -465,6 +465,16 @@ function runPythonPostprocess(script, args, payload, env, logOutput = false, par
       finish(false, { reason: "child-error", detail: String(err.message || err) });
     });
     child.on("close", (code) => finish(code === 0, { exit_code: code }));
+    // Node normally emits close after the child stdio streams close. A
+    // detached helper can exit while a descendant still holds one of those
+    // pipes, leaving the worker stuck in running forever. Exit is the
+    // process-level completion signal, so use it as a bounded fallback and
+    // give stdout and stderr a brief chance to flush before parsing the receipt.
+    child.on("exit", (code, signal) => {
+      setTimeout(() => {
+        finish(code === 0, { exit_code: code, signal });
+      }, 250).unref?.();
+    });
     child.stdin.end(payload);
   });
 }
@@ -3399,6 +3409,7 @@ let postprocessWorkerRunning = false;
 let postprocessBurstRunning = false;
 const POSTPROCESS_DRAIN_FILE = path.join(WORKSPACE_WECHAT, "state/ingest-maintenance-pause");
 const POSTPROCESS_IDLE_RETRY_MS = 60000;
+const POSTPROCESS_STALE_RUNNING_MS = Number(process.env.WECHAT_POSTPROCESS_STALE_RUNNING_MS || 15 * 60 * 1000);
 const POSTPROCESS_FAILURE_FILE = path.join(WORKSPACE_WECHAT, "state", "postprocess-retry-failures.jsonl");
 const CODEX_REPAIR_DIR =
   process.env.WECHAT_CODEX_REPAIR_DIR ||
@@ -3419,6 +3430,47 @@ let activePostprocessCancelRequested = false;
 // the persisted running state; this closes the small synchronous gap before
 // the first await and makes duplicate worker entry harmless.
 const activePostprocessIds = new Set();
+
+function postprocessHandleAlive(job) {
+  for (const field of ['worker_pid', 'child_pid', 'pid']) {
+    const pid = Number(job?.[field]);
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {}
+  }
+  return false;
+}
+
+function recoverStaleRunningPostprocessJobs(now = Date.now()) {
+  let recovered = 0;
+  for (const job of postprocessJobs.values()) {
+    if (job?.status !== 'running' || activePostprocessIds.has(job.id) || postprocessHandleAlive(job)) continue;
+    const startedAt = Date.parse(job.execution_started_at || job.started_at || job.updated_at || '');
+    if (!Number.isFinite(startedAt) || now - startedAt < POSTPROCESS_STALE_RUNNING_MS) continue;
+    const at = new Date(now).toISOString();
+    const receipts = Array.isArray(job.stale_execution_receipts) ? job.stale_execution_receipts : [];
+    receipts.push({
+      at, execution_id: String(job.execution_id || ''), phase: 'stale-running-recovery',
+      detail: 'missing-execution-handle', previous_status: 'running',
+    });
+    job.stale_execution_receipts = receipts.slice(-20);
+    job.recovered_from_status = 'running';
+    job.stale_recovered_at = at;
+    job.stale_recovery_reason = 'missing-execution-handle';
+    job.status = 'queued';
+    job.last_error = 'stale-running-recovered';
+    job.next_attempt_at_ms = now;
+    job.updated_at = at;
+    delete job.started_at;
+    delete job.execution_started_at;
+    delete job.execution_lane;
+    recovered += 1;
+  }
+  if (recovered) writePostprocessJobs();
+  return recovered;
+}
 
 function normalizeSuccessfulPostprocess(job, finished = new Date().toISOString()) {
   if (!job) return job;
@@ -3532,6 +3584,24 @@ function buildCodexRepairPrompt(job, reason, detail = "", requestFile = CODEX_RE
   ].join("\n");
 }
 
+// A terminal marker is only durable when it points at the exact persisted
+// request for this job.  Older restart paths wrote self_repair_triggered_at
+// before the request file was durable, so checking the timestamp alone could
+// strand the job without a Codex repair request forever.
+function hasDurableCodexRepairRequest(job) {
+  const codex = job?.self_repair?.codex_repair;
+  const requestId = String(codex?.request_id || "");
+  const requestFile = typeof codex?.request_file === "string" ? codex.request_file : "";
+  if (!requestId || !requestFile) return false;
+  const root = path.resolve(CODEX_REPAIR_DIR) + path.sep;
+  const resolved = path.resolve(requestFile);
+  if (!resolved.startsWith(root)) return false;
+  const request = readJsonFile(resolved);
+  return String(request?.request_id || "") === requestId &&
+    String(request?.job_id || "") === String(job?.id || "") &&
+    request?.type === "codex-self-repair-request";
+}
+
 function wakeCodexSelfRepair(job, reason, detail = "", stage = "postprocess") {
   const prompt = buildCodexRepairPrompt(job, reason, detail) + "\n另读取state/codex-repair/request-*.json中的新增失败请求；不要仅处理第一条。不得输出密钥或完整聊天记录。";
   const request = {type:"codex-self-repair-request",job_id:job?.id || "", stage,
@@ -3550,16 +3620,27 @@ function wakeCodexSelfRepair(job, reason, detail = "", stage = "postprocess") {
 }
 
 function triggerPostprocessSelfRepair(job, reason, detail = "") {
-  if (job.self_repair_triggered_at) return job.self_repair;
+  // A timestamp without its bound request is an incomplete historical write.
+  const historicalBackfill = reason === "historical-terminal-retry";
+  if (historicalBackfill && job.self_repair?.request_backfill_attempted_at &&
+      !hasDurableCodexRepairRequest(job)) {
+    return job.self_repair;
+  }
+  if (job.self_repair_triggered_at && hasDurableCodexRepairRequest(job)) return job.self_repair;
   const record = writePostprocessFailure(job, reason, detail);
   const codexRepair = wakeCodexSelfRepair(job, reason, detail);
-  job.self_repair_triggered_at = record.at;
+  job.self_repair_triggered_at = job.self_repair_triggered_at || record.at;
   job.self_repair = {
+    ...(job.self_repair && typeof job.self_repair === "object" ? job.self_repair : {}),
     status: codexRepair.status,
-    at: record.at,
+    at: job.self_repair?.at || record.at,
     reason: record.reason,
     action: "retry-disabled-and-codex-self-repair-woken",
     queue_file: POSTPROCESS_JOB_FILE,
+    backfill_attempted_at: job.self_repair?.backfill_attempted_at || record.at,
+    ...(historicalBackfill ? {
+      request_backfill_attempted_at: job.self_repair?.request_backfill_attempted_at || record.at,
+    } : {}),
     codex_repair: codexRepair,
   };
   console.error("[wechat-ingest] postprocess self-diagnosis job=" + job.id +
@@ -4037,7 +4118,9 @@ function loadPostprocessJobs() {
       // durable Codex request per job; the request itself is idempotent and
       // the eventual receipt is diagnostic; source-specific proof is still required.
       if (job.status === "retry" && job.retry_exhausted === true &&
-          !job.self_repair_triggered_at && !job.repair_execution &&
+          !hasDurableCodexRepairRequest(job) &&
+          !job.self_repair?.request_backfill_attempted_at &&
+          !job.repair_execution &&
           !job.recovery_execution && job.evidence_status !== "awaiting-evidence") {
         historicalRepairCandidates.push(job);
       }
@@ -4637,19 +4720,25 @@ async function processPostprocessJob(job, { apiBurst = false, postprocess = hand
   if (!job?.id || activePostprocessIds.has(job.id)) {
     return {skipped: true, reason: "already-running", job};
   }
-  activePostprocessIds.add(job.id);
-  let executionId = "";
-  const repaired = repairPending(job);
-  const recovered = !repaired && recoveryPending(job);
   // A source wait only blocks ordinary attempts. A verified repair grant
   // already carries an execution proof and must be consumed now; otherwise
   // the scheduler keeps postponing the same job forever while its repair
   // authorization remains pending.
-  if (!repaired && postprocessWaitingForMiddle(job)) {
+  const repaired = repairPending(job);
+  const recovered = !repaired && recoveryPending(job);
+  const waitingJob = repaired && job.repair_execution?.proof?.event_patch
+    ? {
+        ...job,
+        event: { ...job.event, ...job.repair_execution.proof.event_patch },
+      }
+    : job;
+  if (!recovered && postprocessWaitingForMiddle(waitingJob)) {
     job.next_attempt_at_ms = Date.now() + POSTPROCESS_IDLE_RETRY_MS;
     writePostprocessJobs();
-    return;
+    return {skipped: true, reason: "waiting-for-middle", job};
   }
+  activePostprocessIds.add(job.id);
+  let executionId = "";
   if (repaired) {
     job.repair_execution.pending = false;
     job.repair_execution.attempts = Number(job.repair_execution.attempts || 0) + 1;
@@ -5018,6 +5107,7 @@ async function runPostprocessWorker() {
 
   try {
     for (;;) {
+      recoverStaleRunningPostprocessJobs();
       if (stopped()) break;
       // Compatibility guard: the burst selector is permanently disabled.
       if (shouldUsePostprocessApiBurst() && active.size === 0) {
@@ -5437,6 +5527,7 @@ module.exports = {
   repairPending, grantRepair, grantRootCauseRepair, grantProviderRetry, processPostprocessJob,
   processMemoryJob, triggerMemorySelfRepair, memoryNoopResult, resolveMemoryNoop,
   selectPostprocessJob, postprocessProviderRetryAt,
+  recoverStaleRunningPostprocessJobs,
   recoveryPending,
   repairOrRecoveryPending,
   recoveryExecutionRunning,
