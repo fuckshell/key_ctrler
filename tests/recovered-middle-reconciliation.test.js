@@ -1,0 +1,114 @@
+const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const {after, test} = require("node:test");
+
+const root = fs.mkdtempSync(path.join(os.tmpdir(), "recovered-middle-reconcile-"));
+process.env.WECHAT_WORKSPACE = root;
+process.env.WECHAT_POSTPROCESS_JOB_FILE = path.join(root, "state/jobs.json");
+process.env.WECHAT_CODEX_REPAIR_DIR = path.join(root, "repair");
+fs.mkdirSync(path.join(root, "state"), {recursive: true});
+fs.writeFileSync(path.join(root, "state/ingest-maintenance-pause"), "test");
+const {loadPostprocessJobs, reconcileRecoveredMediaJobs} = require("../wechat-ingest");
+
+after(() => fs.rmSync(root, {recursive: true, force: true}));
+
+function sha(bytes) {
+  return crypto.createHash("sha256").update(bytes).digest("hex");
+}
+
+function writeManifest(rows) {
+  const manifest = path.join(root, "media/manifest.jsonl");
+  fs.mkdirSync(path.dirname(manifest), {recursive: true});
+  fs.writeFileSync(manifest, rows.map(row => JSON.stringify(row)).join("\n") + "\n");
+}
+
+function writeJobs(jobs) {
+  fs.writeFileSync(process.env.WECHAT_POSTPROCESS_JOB_FILE,
+    JSON.stringify({version: 1, jobs}, null, 2));
+  loadPostprocessJobs();
+}
+
+function imageJob(id, key, error, sourceSha, localId) {
+  return {
+    id, status: "queued", attempts: 1, last_error: error,
+    event: {
+      media_kind: "image", talker: "chat@chatroom", content: "[图片]",
+      media_message_key: key, media_local_id: localId, media_server_id: "server-" + localId,
+      ts: 1795050000000 + localId, media_file_sha256: sourceSha,
+      media_thumbnail_sha256: sourceSha, media_captured_tier: "thumbnail",
+      media_middle_pending: true,
+    },
+  };
+}
+
+test("reconciles a recovered middle source for image-tier waits", () => {
+  const bytes = Buffer.from("verified-middle-image");
+  const middlePath = path.join(root, "middle.jpg");
+  fs.writeFileSync(middlePath, bytes);
+  const middleSha = sha(bytes);
+  const key = "chat@chatroom|11|1795050001|server-11";
+  writeManifest([{message_key: key, talker: "chat@chatroom", local_id: 11,
+    server_id: "server-11", ts: 1795050001000, kind: "image", status: "pending",
+    captured_tier: "middle", file: middlePath, middle_sha256: middleSha,
+    file_sha: middleSha, thumbnail_sha256: "a".repeat(64), middle_pending: false}]);
+  const job = imageJob("middle-image-tier", key, "image-tier-not-ready", "a".repeat(64), 11);
+  writeJobs([job]);
+  assert.deepEqual(reconcileRecoveredMediaJobs("2026-11-19T00:00:00.000Z"), {changed: 1});
+  const saved = JSON.parse(fs.readFileSync(process.env.WECHAT_POSTPROCESS_JOB_FILE)).jobs[0];
+  assert.equal(saved.status, "queued");
+  assert.equal(saved.last_error, null);
+  assert.equal(saved.event.media_file_sha256, middleSha);
+  assert.equal(saved.event.media_captured_tier, "middle");
+  assert.equal(saved.event.media_middle_pending, false);
+  assert.equal(saved.next_attempt_at_ms, 0);
+  assert.equal(saved.media_source_refresh.reason, "manifest-middle-reconciled");
+});
+
+test("reconciles temporary-new-messages-pending after middle recovery", () => {
+  const bytes = Buffer.from("second-verified-middle");
+  const middlePath = path.join(root, "middle-2.jpg");
+  fs.writeFileSync(middlePath, bytes);
+  const middleSha = sha(bytes);
+  const key = "chat@chatroom|12|1795050002|server-12";
+  writeManifest([{message_key: key, talker: "chat@chatroom", local_id: 12,
+    server_id: "server-12", ts: 1795050002000, kind: "image", status: "pending",
+    captured_tier: "middle", file: middlePath, middle_sha256: middleSha,
+    file_sha: middleSha, thumbnail_sha256: "b".repeat(64), middle_pending: false}]);
+  writeJobs([imageJob("middle-temporary-wait", key, "temporary-new-messages-pending", "b".repeat(64), 12)]);
+  assert.deepEqual(reconcileRecoveredMediaJobs("2026-11-19T00:00:00.000Z"), {changed: 1});
+  const saved = JSON.parse(fs.readFileSync(process.env.WECHAT_POSTPROCESS_JOB_FILE)).jobs.find(job => job.id === "middle-temporary-wait");
+  assert.ok(saved);
+  assert.equal(saved.last_error, null);
+  assert.equal(saved.event.media_file_sha256, middleSha);
+});
+
+test("does not upgrade thumbnail-only or filtered records", () => {
+  const thumbBytes = Buffer.from("thumbnail-only");
+  const thumbPath = path.join(root, "thumb.jpg");
+  fs.writeFileSync(thumbPath, thumbBytes);
+  const thumbSha = sha(thumbBytes);
+  const thumbKey = "chat@chatroom|13|1795050003|server-13";
+  const filteredKey = "chat@chatroom|14|1795050004|server-14";
+  writeManifest([
+    {message_key: thumbKey, talker: "chat@chatroom", local_id: 13,
+      server_id: "server-13", ts: 1795050003000, kind: "image", status: "pending",
+      captured_tier: "thumbnail", file: thumbPath, file_sha: thumbSha,
+      thumbnail_sha256: thumbSha, middle_pending: true},
+    {message_key: filteredKey, talker: "chat@chatroom", local_id: 14,
+      server_id: "server-14", ts: 1795050004000, kind: "image", status: "filtered",
+      vision_state: "filtered_ad_source", vision_last_error: "filtered-ad-source-policy"},
+  ]);
+  const jobs = [
+    imageJob("thumbnail-only", thumbKey, "image-tier-not-ready", thumbSha, 13),
+    imageJob("filtered-image", filteredKey, "image-tier-not-ready", thumbSha, 14),
+  ];
+  writeJobs(jobs);
+  assert.deepEqual(reconcileRecoveredMediaJobs("2026-11-19T00:00:00.000Z"), {changed: 0});
+  const saved = JSON.parse(fs.readFileSync(process.env.WECHAT_POSTPROCESS_JOB_FILE)).jobs;
+  assert.equal(saved[0].last_error, "image-tier-not-ready");
+  assert.equal(saved[0].event.media_captured_tier, "thumbnail");
+  assert.equal(saved[1].last_error, "image-tier-not-ready");
+});
