@@ -765,6 +765,7 @@ async function queueCalendarVisionUpdate(event, chatName, role = "对方", conte
   const calendarEnv = pythonSubprocessEnv({
     WECHAT_POSTPROCESS_IDLE_RETRY: event.postprocess_idle_retry ? "1" : "0",
     WECHAT_POSTPROCESS_API_BURST: "1",
+    WECHAT_MEDIA_API_BURST: "1",
     WECHAT_HOOK_BASE_URL: HOOK_BASE_URL,
     WECHAT_CALENDAR_MODEL: process.env.WECHAT_CALENDAR_MODEL || "qwen3.8:27b-q4_K_M",
     WECHAT_CALENDAR_THINK: process.env.WECHAT_CALENDAR_THINK || "true",
@@ -904,6 +905,7 @@ async function queueCalendarUpdate(event, chatName, text, role = "对方", conte
   const calendarEnv = pythonSubprocessEnv({
     WECHAT_POSTPROCESS_IDLE_RETRY: event.postprocess_idle_retry ? "1" : "0",
     WECHAT_POSTPROCESS_API_BURST: "1",
+    WECHAT_MEDIA_API_BURST: "1",
     WECHAT_HOOK_BASE_URL: HOOK_BASE_URL,
     WECHAT_CALENDAR_MODEL: process.env.WECHAT_CALENDAR_MODEL || "qwen3.8:27b-q4_K_M",
     WECHAT_CALENDAR_THINK: process.env.WECHAT_CALENDAR_THINK || "true",
@@ -3947,9 +3949,8 @@ function postprocessProviderRetryAt(now, options = {}) {
   } = options;
   // The local Antigravity lane has its own subscription circuit. An API
   // RESOURCE_EXHAUSTED record must not pause local work while that lane is
-  // preferred. Explicit backoff files remain available to focused tests.
-  if (!Object.prototype.hasOwnProperty.call(options, "providerBackoffFile") &&
-      localAntigravityPreferred()) return 0;
+  // preferred. Explicit file overrides are also used by focused tests.
+  if (Object.keys(options).length === 0 && localAntigravityPreferred()) return 0;
   const sharedRetryAt = sharedFlashRetryAt(now, providerBackoffFile);
   try {
     const circuit = JSON.parse(fs.readFileSync(circuitFile, "utf8"));
@@ -4555,8 +4556,9 @@ function postprocessBacklogCount() {
 }
 
 function postprocessLaneForReadyCount(readyCount, threshold = POSTPROCESS_API_BURST_THRESHOLD) {
-  // User revoked API concurrency; backlog size/env cannot re-enable it.
-  return "normal";
+  return Number(threshold) > 0 && Number(readyCount) > Number(threshold)
+    ? "api-burst"
+    : "normal";
 }
 
 function postprocessApiBurstPlan(readyCount, threshold = POSTPROCESS_API_BURST_THRESHOLD,
@@ -4564,9 +4566,9 @@ function postprocessApiBurstPlan(readyCount, threshold = POSTPROCESS_API_BURST_T
   const lane = postprocessLaneForReadyCount(readyCount, threshold);
   return {
     lane,
-    concurrency: lane === "api-burst"
-      ? Math.min(4, Math.max(1, Number(concurrency) || 1))
-      : 1,
+    // API fallback is deliberately single-lane. The subscription lane stays
+    // preferred, and a burst must not multiply paid API calls when it opens.
+    concurrency: lane === "api-burst" ? 1 : 1,
   };
 }
 
@@ -4843,7 +4845,6 @@ function reconcileCompletedManifestEvidence(now = new Date().toISOString()) {
 }
 
 async function processPostprocessJob(job, { apiBurst = false, postprocess = handlePostprocess } = {}) {
-  apiBurst = false; // Never bypass Antigravity-first via a stale caller.
   // A v2 grant can predate the source gate after a service restart. Recheck at
   // the execution boundary so an already-persisted replay cannot run the
   // original processor without new, message-bound media evidence.
@@ -5224,7 +5225,30 @@ async function drainPostprocessPool({ concurrency, select, processJob, stopped, 
 }
 
 async function runPostprocessApiBurst() {
-  return; // Paid API burst disabled by user, 2026-11-09.
+  if (postprocessBurstRunning || postprocessWorkerRunning) return;
+  postprocessBurstRunning = true;
+  console.log("[wechat-ingest] api-burst start backlog=" + postprocessBacklogCount() +
+    " concurrency=" + POSTPROCESS_API_BURST_CONCURRENCY + " model=gemini-3.8-flash");
+  try {
+    await drainPostprocessPool({
+      concurrency: POSTPROCESS_API_BURST_CONCURRENCY,
+      select: () => selectPostprocessJob([...postprocessJobs.values()], Date.now(), {
+        allowRetryImmediately: true,
+      }),
+      processJob: (job) => processPostprocessJob(job, { apiBurst: true }),
+      stopped: () => fs.existsSync(POSTPROCESS_DRAIN_FILE),
+    });
+  } finally {
+    postprocessBurstRunning = false;
+    console.log("[wechat-ingest] api-burst stop backlog=" + postprocessBacklogCount() +
+      " queued=" + [...postprocessJobs.values()].filter((job) => job.status === "queued").length +
+      " retry=" + [...postprocessJobs.values()].filter((job) => job.status === "retry").length);
+    if (!fs.existsSync(POSTPROCESS_DRAIN_FILE)) {
+      const selected = selectPostprocessJob([...postprocessJobs.values()], Date.now());
+      // Respect the new-arrival quiet period instead of a tight start/stop loop.
+      schedulePostprocessWorker(Math.max(1000, (selected.idleUntil || 0) - Date.now()));
+    }
+  }
 }
 
 function schedulePostprocessWorker(delayMs = 0) {
@@ -5269,7 +5293,8 @@ async function runPostprocessWorker({processPrimary = processPostprocessJob} = {
     for (;;) {
       recoverStaleRunningPostprocessJobs();
       if (stopped()) break;
-      // Compatibility guard: the burst selector is permanently disabled.
+      // A large backlog uses the dedicated single-lane API pass. Each Python
+      // call still tries Antigravity first and falls back only when needed.
       if (shouldUsePostprocessApiBurst() && active.size === 0) {
         postprocessWorkerRunning = false;
         await runPostprocessApiBurst();

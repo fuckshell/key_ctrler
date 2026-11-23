@@ -84,10 +84,10 @@ test('historical recovery first attempt is idle work and cannot reset new-arriva
   assert.equal(selectPostprocessJob([history],now).job.id,history.id);
 });
 
-test('paid API burst stays disabled regardless of backlog and stale worker settings', () => {
+test('API burst activates only above the backlog threshold and stays single-lane', () => {
   assert.equal(postprocessLaneForReadyCount(50, 50), 'normal');
-  assert.equal(postprocessLaneForReadyCount(51, 50), 'normal');
-  assert.deepEqual(postprocessApiBurstPlan(917, 50, 99), {lane: 'normal', concurrency: 1});
+  assert.equal(postprocessLaneForReadyCount(51, 50), 'api-burst');
+  assert.deepEqual(postprocessApiBurstPlan(917, 50, 99), {lane: 'api-burst', concurrency: 1});
   assert.deepEqual(postprocessApiBurstPlan(20, 50, 99), {lane: 'normal', concurrency: 1});
 });
 
