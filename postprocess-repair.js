@@ -71,7 +71,7 @@ function repairPending(job) {
   // proof fields as a current grant; it must never renew itself.
   // A Codex self-repair receipt is diagnostic evidence only.  It must never
   // reopen an exhausted message and execute the original postprocess again.
-  if (!['completed-flash-ocr-v1', 'verified-middle-upgrade-v1', 'verified-provider-retry-v1', 'verified-middle-dispatch-v2', 'terminal-resolution-v1', 'verified-screen-fallback-v1', 'verified-merged-header-v1', 'verified-flash-cache-v1', 'verified-readonly-calendar-v1', 'verified-json-schema-preflight-v1', 'terminal-resolution-v2', 'codex-root-cause-repair-v2', 'verified-source-ocr-v1', 'verified-provider-recovery-v1', 'verified-filehelper-media-recovery-v1', 'verified-filehelper-media-retry-v2'].includes(grant.fix_id)) return false;
+  if (!['completed-flash-ocr-v1', 'verified-middle-upgrade-v1', 'verified-provider-retry-v1', 'verified-middle-dispatch-v2', 'terminal-resolution-v1', 'verified-screen-fallback-v1', 'verified-merged-header-v1', 'verified-flash-cache-v1', 'verified-readonly-calendar-v1', 'verified-json-schema-preflight-v1', 'terminal-resolution-v2', 'codex-root-cause-repair-v2', 'codex-receipt-authorized-replay-v1', 'verified-source-ocr-v1', 'verified-provider-recovery-v1', 'verified-filehelper-media-recovery-v1', 'verified-filehelper-media-retry-v2'].includes(grant.fix_id)) return false;
   const proof = grant.proof;
   return Boolean(proof?.ok === true && proof.job_id === job.id &&
     Number(proof.attempts) === grant.attempts_before &&
@@ -79,6 +79,35 @@ function repairPending(job) {
 }
 
 function grantRepair(job, request, proof, now = new Date().toISOString()) {
+
+  if (request.fix_id === 'codex-receipt-authorized-replay-v1') {
+    const crypto = require('node:crypto');
+    const eventSha = job?.event
+      ? crypto.createHash('sha256').update(JSON.stringify(job.event)).digest('hex') : '';
+    if (!job || job.status !== 'retry' || job.retry_exhausted !== true ||
+        job.repair_execution || job.recovery_execution ||
+        request.expected_attempts !== Number(job.attempts || 0) ||
+        request.expected_error !== job.last_error ||
+        proof?.ok !== true || proof.fix_id !== request.fix_id ||
+        proof.job_id !== job.id || proof.attempts !== Number(job.attempts || 0) ||
+        proof.last_error !== job.last_error || proof.event_sha256 !== eventSha ||
+        !/^[a-f0-9]{64}$/.test(proof.event_sha256 || '') ||
+        !proof.receipt_id || proof.receipt_request_id !== proof.request_id ||
+        !proof.request_id || !/^[a-f0-9]{64}$/.test(proof.audit_sha256 || '') ||
+        !Number.isInteger(Number(proof.changed_files)) || Number(proof.changed_files) < 1 ||
+        !['online-rate-limit', 'online-calendar-failed', 'online-clarification-suppressed'].includes(job.last_error))
+      throw new Error('codex-receipt-replay-proof-invalid');
+    job.repair_execution = {
+      fix_id: request.fix_id, job_id: job.id, granted_at: now, pending: true,
+      attempts: 0, attempts_before: Number(job.attempts || 0),
+      media_waits_before: Number(job.media_waits || 0),
+      previous_error: job.last_error, previous_exhausted: true, proof,
+    };
+    job.status = 'queued';
+    job.updated_at = now;
+    job.next_attempt_at_ms = 0;
+    return job;
+  }
 
   if (request.fix_id === 'verified-filehelper-media-retry-v2') {
     const old = job?.repair_execution;

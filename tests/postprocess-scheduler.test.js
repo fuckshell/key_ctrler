@@ -270,3 +270,18 @@ test('only a current, bounded provider circuit matching Python config SHA defers
   fs.unlinkSync(circuitFile);
   assert.equal(read(), 0);
 });
+
+test('read-only yield before a first attempt keeps its backoff and precedes idle work', () => {
+  const yielded = job('busy', now - 120000, {started_at: new Date(now - 30000).toISOString(),
+    attempts: 0, last_error: 'temporary-new-messages-pending', next_attempt_at_ms: now + 10,
+    result: {calendar: {result: {ok: false, retryable: true, reason: 'temporary-new-messages-pending'}}}});
+  const live = job('live', now);
+  const queue = [yielded, live];
+  assert.equal(selectPostprocessJob(queue, now + 10).job, live);
+  live.status = 'succeeded';
+  assert.equal(selectPostprocessJob(queue, now).job, undefined);
+  assert.equal(selectPostprocessJob(queue, now + 10).job, yielded);
+  for (const change of [{attempts: 1}, {event: {media_recovered: true}}, {result: null}]) {
+    assert.equal(selectPostprocessJob([{...yielded, ...change}, live], now + 10).job, undefined);
+  }
+});

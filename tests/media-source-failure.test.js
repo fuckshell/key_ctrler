@@ -104,14 +104,44 @@ test('legacy image registration never takes over native download paths', async (
 test('a middle label with thumbnail bytes does not stop native source acquisition', () => {
   const local=path.join(root,'identity.jpg');
   fs.writeFileSync(local,'fixture');
+  const validMiddle=path.join(root,'valid-middle.png');
+  fs.writeFileSync(validMiddle,Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=','base64'));
   const row={id:'identity',source:'pc-hook',kind:'image',talker:'fixture',
     image_hash:'a'.repeat(32),status:'pending',canonical_file:local,
     captured_tier:'middle',file_sha:'thumbnail',middle_sha256:'thumbnail',
     thumbnail_sha256:'thumbnail',vision_attempts:2,vision_state:'repair_required'};
   assert.equal(media.selectPassiveImageCandidates([row]).length,1);
   assert.equal(media.selectPassiveImageCandidates([{...row,
+    file:validMiddle,canonical_file:validMiddle,
     file_sha:'native-middle',middle_sha256:'native-middle'}]).length,0);
   assert.equal(row.vision_attempts,2);
+});
+
+test('corrupt middle manifest bytes do not reuse the completed prescreen', async () => {
+  const repairGate=fixture('wechat-pc-media.js', `
+    getFilesRoot = async () => WORKSPACE_WECHAT;
+    findAccountDir = () => WORKSPACE_WECHAT;
+    triggerImageCdnDownload = async () => {};
+    fetchMessageResources = async () => [];
+    materializeImage = async () => {
+      module.exports.materializeCalled = true;
+      return {ok:false,middle_pending:true,reason:'waiting_native_middle_cache'};
+    };
+  `);
+  const messageKey='corrupt-middle@chatroom|99|1794273188|90071992547409933';
+  const corrupt=path.join(root,'corrupt-middle.jpg');
+  fs.writeFileSync(corrupt,'fixture');
+  repairGate.appendManifest({id:messageKey,message_key:messageKey,talker:'corrupt-middle@chatroom',
+    local_id:99,ts:1794273188000,server_id:'90071992547409933',kind:'image',status:'pending',
+    file:corrupt,canonical_file:corrupt,file_sha:'d'.repeat(64),middle_sha256:'d'.repeat(64),
+    captured_tier:'middle',middle_pending:false,vision_state:'retry'});
+  const event={talker:'corrupt-middle@chatroom',local_id:99,msg_svr_id:'90071992547409933',
+    ts:1794273188000,type:3,content:'[图片]'};
+  const enriched=await repairGate.enrichEventMedia({},event,
+    {local_id:99,msg_svr_id:'90071992547409933',create_time:1794273188,local_type:3,message_content:'[图片]'});
+  assert.equal(repairGate.materializeCalled,true);
+  assert.notEqual(enriched.media_method,'reuse_completed_prescreen');
+  assert.equal(enriched.media_status,'waiting_native_middle_cache');
 });
 
 test('durable postprocess retry remains eligible after coarse screening is complete', () => {

@@ -242,11 +242,6 @@ function pythonSubprocessEnv(extra = {}) {
     delete env.HTTPS_PROXY;
     delete env.http_proxy;
     delete env.https_proxy;
-  } else {
-    env.HTTP_PROXY = env.HTTP_PROXY || "http://127.0.0.1:7890";
-    env.HTTPS_PROXY = env.HTTPS_PROXY || "http://127.0.0.1:7890";
-    env.http_proxy = env.HTTP_PROXY;
-    env.https_proxy = env.HTTPS_PROXY;
   }
   env.WECHAT_GEMINI_VISION_MODEL = env.WECHAT_GEMINI_VISION_MODEL || "gemini-3.8-flash";
   return env;
@@ -770,7 +765,6 @@ async function queueCalendarVisionUpdate(event, chatName, role = "对方", conte
   const calendarEnv = pythonSubprocessEnv({
     WECHAT_POSTPROCESS_IDLE_RETRY: event.postprocess_idle_retry ? "1" : "0",
     WECHAT_POSTPROCESS_API_BURST: "1",
-    WECHAT_MEDIA_API_BURST: "1",
     WECHAT_HOOK_BASE_URL: HOOK_BASE_URL,
     WECHAT_CALENDAR_MODEL: process.env.WECHAT_CALENDAR_MODEL || "qwen3.8:27b-q4_K_M",
     WECHAT_CALENDAR_THINK: process.env.WECHAT_CALENDAR_THINK || "true",
@@ -910,7 +904,6 @@ async function queueCalendarUpdate(event, chatName, text, role = "对方", conte
   const calendarEnv = pythonSubprocessEnv({
     WECHAT_POSTPROCESS_IDLE_RETRY: event.postprocess_idle_retry ? "1" : "0",
     WECHAT_POSTPROCESS_API_BURST: "1",
-    WECHAT_MEDIA_API_BURST: "1",
     WECHAT_HOOK_BASE_URL: HOOK_BASE_URL,
     WECHAT_CALENDAR_MODEL: process.env.WECHAT_CALENDAR_MODEL || "qwen3.8:27b-q4_K_M",
     WECHAT_CALENDAR_THINK: process.env.WECHAT_CALENDAR_THINK || "true",
@@ -2491,7 +2484,7 @@ function contactCorpusSnippet(text) {
   return "";
 }
 
-async function queuePeopleMemoryUpdate(event, speaker, text, role, contextRows = [], speakerWxid = "", cacheOnly = false) {
+async function queuePeopleMemoryUpdate(event, speaker, text, role, contextRows = [], speakerWxid = "", cacheOnly = false, admitted = false) {
   // Media events carry a human-readable placeholder such as "[图片]" or
   // "[动画表情]".  people-memory only accepts actual text and deliberately
   // reports no-text for those placeholders; skip the low-priority profile
@@ -2536,6 +2529,7 @@ async function queuePeopleMemoryUpdate(event, speaker, text, role, contextRows =
     ["--stdin"],
     payload,
     pythonSubprocessEnv({ WECHAT_PEOPLE_MODEL: "gemini-3.8-flash-medium", WECHAT_POSTPROCESS_TIMEOUT_MS: "420000",
+      ...(admitted ? { WECHAT_POSTPROCESS_IDLE_RETRY: "0" } : {}),
       ...(cacheOnly ? { WECHAT_PEOPLE_CACHE_ONLY: "1" } : {}) }),
     true,
     true,
@@ -3384,7 +3378,7 @@ function resolveMemoryNoop(job) {
   return true;
 }
 
-async function handlePeoplePostprocess(event, {cacheOnly = false} = {}) {
+async function handlePeoplePostprocess(event, {cacheOnly = false, admitted = false} = {}) {
   const noop = memoryNoopResult(event);
   if (noop) return {ok: true, result: noop};
   const { sender, text } = parseGroupContent(event.talker, event.content ?? event.text ?? "");
@@ -3397,7 +3391,7 @@ async function handlePeoplePostprocess(event, {cacheOnly = false} = {}) {
   if (outgoing && event.agent_generated) return {ok: true, result: {ok: true, status: "noop", reason: "agent-self-echo"}};
   return queuePeopleMemoryUpdate(event, outgoing ? "贺泽宇" : senderDisplay || chatName,
     text, outgoing ? "我" : "对方", contextRows,
-    outgoing ? event.self_wxid || "" : event.talker?.includes("@chatroom") ? sender : event.talker, cacheOnly);
+    outgoing ? event.self_wxid || "" : event.talker?.includes("@chatroom") ? sender : event.talker, cacheOnly, admitted);
 }
 
 // Calendar/profile work must not be tied to the browser/bridge connection.
@@ -3866,16 +3860,36 @@ function normalizeTerminalMiddleMedia(job) {
   }
 }
 
-function isIdlePostprocessJob(job) {
-  return Boolean(job.started_at || job.event?.media_recovered);
+function yieldedFirstAttempt(job) {
+  const receipt = job.result?.calendar?.result;
+  return job.status === "queued" && job.attempts === 0 && job.started_at &&
+    !job.retry_exhausted && !job.event?.media_recovered && !job.media_waits &&
+    !job.repair_previous_status && !job.repair_execution && !job.recovery_execution &&
+    job.last_error === "temporary-new-messages-pending" &&
+    receipt?.ok === false && receipt.retryable === true && receipt.reason === job.last_error;
 }
 
+function isIdlePostprocessJob(job) {
+  return Boolean(job.event?.media_recovered || (job.started_at && !yieldedFirstAttempt(job)));
+}
+
+const VERIFIED_MIDDLE_RECOVERY_FIX_ID = "verified-middle-recovery-v1";
+
 function recoveryPending(job) {
-  // All historical recovery_execution variants were granted from process
-  // exits or scheduler versions, without message/source/no-write proof.
-  // Preserve their audit fields, but never use them as execution permission.
-  // Independently verified recovery goes through repairPending().
-  return false;
+  const recovery = job?.recovery_execution;
+  const proof = recovery?.proof;
+  // Historical recovery markers were granted without message/source proof.
+  // Only the manifest-backed middle-source recovery created below can enter
+  // the worker. Its original attempt budget remains immutable.
+  return Boolean(recovery?.fix_id === VERIFIED_MIDDLE_RECOVERY_FIX_ID &&
+    recovery.pending === true && recovery.job_id === job?.id &&
+    proof?.ok === true && proof.fix_id === VERIFIED_MIDDLE_RECOVERY_FIX_ID &&
+    proof.job_id === job?.id &&
+    proof.attempts === Number(job.attempts || 0) &&
+    proof.last_error === recovery.previous_error &&
+    /^[a-f0-9]{64}$/.test(String(proof.file_sha || "")) &&
+    proof.message_key === String(job.event?.media_message_key || "") &&
+    job.retry_exhausted !== true);
 }
 
 function repairOrRecoveryPending(job) {
@@ -3889,14 +3903,7 @@ function recoveryExecutionRunning(job) {
       job.repair_execution?.started_at));
 }
 
-function postprocessProviderRetryAt(now, {
-  circuitFile = path.join(WORKSPACE_WECHAT, "calendar/context_online_circuit.json"),
-  providerBackoffFile = path.join(WORKSPACE_WECHAT, "state/gemini-provider-backoff.json"),
-  configFiles = [
-    process.env.OPENCLAW_CONFIG_PATH || path.join(process.env.HOME || "/home/su", ".openclaw/openclaw.json"),
-    path.join(process.env.HOME || "/home/su", ".openclaw/agents/wechat-calendar/agent/auth-profiles.json"),
-  ],
-} = {}) {
+function sharedFlashRetryAt(now, providerBackoffFile = path.join(WORKSPACE_WECHAT, "state/gemini-provider-backoff.json")) {
   let sharedRetryAt = 0;
   try {
     const shared = JSON.parse(fs.readFileSync(providerBackoffFile, "utf8"));
@@ -3907,6 +3914,43 @@ function postprocessProviderRetryAt(now, {
           at > now && at <= now + 86400000) sharedRetryAt = Math.max(sharedRetryAt, at);
     }
   } catch { /* No active provider rejection has been recorded. */ }
+  return sharedRetryAt;
+}
+
+function memoryProviderRetryAt(now) {
+  const flashRetryAt = sharedFlashRetryAt(now);
+  if (!flashRetryAt) return 0;
+  const subscription = readJsonFile(path.join(WORKSPACE_WECHAT, "state/antigravity-screen/provider.json"));
+  const retryAfter = subscription?.retry_after || (subscription?.blocked ? subscription.quota_checked_at + 600 : 0);
+  const subscriptionRetryAt = retryAfter * 1000;
+  return typeof retryAfter === "number" && subscriptionRetryAt > now && subscriptionRetryAt <= now + 86400000
+    ? Math.min(subscriptionRetryAt, flashRetryAt) : 0;
+}
+
+function localAntigravityPreferred() {
+  const config = readJsonFile(path.join(WORKSPACE_WECHAT, "privacy/antigravity_executor.json")) || {};
+  const executor = String(process.env.WECHAT_CALENDAR_EXECUTOR ||
+    config.executor || config.requested_executor || "").trim().toLowerCase();
+  const screenProvider = String(process.env.WECHAT_CALENDAR_SCREEN_PROVIDER || "local").trim().toLowerCase();
+  return ["antigravity", "antigravity-prefer", "agy"].includes(executor) &&
+    ["local", "antigravity-prefer"].includes(screenProvider);
+}
+
+function postprocessProviderRetryAt(now, options = {}) {
+  const {
+    circuitFile = path.join(WORKSPACE_WECHAT, "calendar/context_online_circuit.json"),
+    providerBackoffFile,
+    configFiles = [
+      process.env.OPENCLAW_CONFIG_PATH || path.join(process.env.HOME || "/home/su", ".openclaw/openclaw.json"),
+      path.join(process.env.HOME || "/home/su", ".openclaw/agents/wechat-calendar/agent/auth-profiles.json"),
+    ],
+  } = options;
+  // The local Antigravity lane has its own subscription circuit. An API
+  // RESOURCE_EXHAUSTED record must not pause local work while that lane is
+  // preferred. Explicit backoff files remain available to focused tests.
+  if (!Object.prototype.hasOwnProperty.call(options, "providerBackoffFile") &&
+      localAntigravityPreferred()) return 0;
+  const sharedRetryAt = sharedFlashRetryAt(now, providerBackoffFile);
   try {
     const circuit = JSON.parse(fs.readFileSync(circuitFile, "utf8"));
     const retryAt = circuit.retry_after * 1000;
@@ -3947,6 +3991,13 @@ function selectPostprocessJob(jobs, now, {
   const ready = allReady.filter((entry) =>
     runningRecoveries < POSTPROCESS_RECOVERY_CONCURRENCY || !repairOrRecoveryPending(entry));
   const byCreation = (a, b) => String(a.created_at).localeCompare(String(b.created_at)) || String(a.id).localeCompare(String(b.id));
+  // An authorized Codex replay has already passed receipt and event checks.
+  // Give it a worker turn ahead of the quiet-period retry gate so continuous
+  // new arrivals cannot starve a repair the user explicitly requested.
+  const authorizedRepairs = ready.filter((job) =>
+    job.repair_execution?.fix_id === "codex-receipt-authorized-replay-v1" &&
+    repairPending(job)).sort(byCreation);
+  if (authorizedRepairs.length) return {job: authorizedRepairs[0]};
   // Direct conversations must not wait behind bulk group attachments.
   // This only ranks first attempts: every retry stays in the idle lane.
   const freshRank = (job) => {
@@ -3956,7 +4007,8 @@ function selectPostprocessJob(jobs, now, {
     return (group ? 2 : 0) + (media ? 1 : 0);
   };
   const fresh = ready.filter((job) => !isIdlePostprocessJob(job))
-    .sort((a, b) => freshRank(a) - freshRank(b) || -byCreation(a, b));
+    .sort((a, b) => Number(Boolean(a.started_at)) - Number(Boolean(b.started_at)) ||
+      freshRank(a) - freshRank(b) || (a.started_at ? byCreation(a, b) : -byCreation(a, b)));
   if (fresh.length) return { job: fresh[0] };
   // Retries have no reserved slots. Start them only with no ready new work,
   // after a full minute without a new arrival, and keep every backoff intact.
@@ -4078,8 +4130,7 @@ function loadPostprocessJobs() {
         } else job.memory_status = "queued";
         changed = true;
       }
-      // Terminal failures stay terminal across restarts, including records
-      // left by the old migration. A restart is never permission to replay.
+      // Terminal failures stay terminal across restarts.
       if (job.status === "queued" && job.retry_exhausted && !repairPending(job)) {
         job.status = "retry";
         changed = true;
@@ -4236,6 +4287,9 @@ function verifiedCodexReceipt(receipt, request, job) {
     changed_files: changedFiles,
     audit_path: auditPath,
     audit_sha256: crypto.createHash('sha256').update(fs.readFileSync(auditPath)).digest('hex'),
+    receipt_id: String(receipt.request_id),
+    request_id: String(receipt.request_id),
+    event_sha256: crypto.createHash('sha256').update(JSON.stringify(job.event || {})).digest('hex'),
   };
 }
 
@@ -4249,19 +4303,60 @@ function reconcileCodexRepairReceipts(now = new Date().toISOString()) {
     const receiptPath = path.join(CODEX_REPAIR_DIR, name);
     const receipt = readJsonFile(receiptPath);
     if (!receipt || receipt.status !== "succeeded") continue;
-    if (receipt.consumed_outcome) continue;
     const job = postprocessJobs.get(String(receipt.job_id || ""));
     if (!job) continue;
+    const replayEligible = ["online-rate-limit", "online-calendar-failed",
+      "online-clarification-suppressed"].includes(String(job.last_error || ""));
+    if (receipt.consumed_outcome && !(receipt.consumed_outcome === "diagnosis-only" &&
+        replayEligible && !receipt.replay_fix_id)) continue;
     const requestPath = path.join(CODEX_REPAIR_DIR, "request-" + String(receipt.request_id || "") + ".json");
     const request = readJsonFile(requestPath);
     const evidence = verifiedCodexReceipt(receipt, request, job);
     if (!evidence) continue;
-    // Source audit proves code changed, not that this message is safe to
-    // replay. Keep the original job and budget untouched. Source-specific
-    // validators/grantRepair remain the only route back to its processor.
-    receipt.consumed_at = now;
-    receipt.consumed_outcome = "diagnosis-only";
-    receipt.evidence = evidence;
+    if (!replayEligible) {
+      receipt.consumed_at = now;
+      receipt.consumed_outcome = "diagnosis-only";
+      receipt.evidence = evidence;
+      const temp = receiptPath + ".tmp-" + process.pid;
+      fs.writeFileSync(temp, JSON.stringify(receipt, null, 2), "utf8");
+      fs.renameSync(temp, receiptPath);
+      continue;
+    }
+    const replayRequest = {
+      ...request,
+      fix_id: "codex-receipt-authorized-replay-v1",
+      expected_attempts: Number(job.attempts || 0),
+      expected_error: job.last_error,
+    };
+    const proof = {
+      ok: true,
+      fix_id: replayRequest.fix_id,
+      job_id: job.id,
+      attempts: Number(job.attempts || 0),
+      last_error: job.last_error,
+      receipt_id: evidence.receipt_id,
+      receipt_request_id: evidence.request_id,
+      request_id: evidence.request_id,
+      audit_sha256: evidence.audit_sha256,
+      changed_files: evidence.changed_files,
+      event_sha256: evidence.event_sha256,
+    };
+    try {
+      grantRepair(job, replayRequest, proof, now);
+      receipt.consumed_at = now;
+      receipt.consumed_outcome = "replay-authorized";
+      receipt.replay_fix_id = replayRequest.fix_id;
+      receipt.replay_proof = proof;
+      receipt.evidence = evidence;
+      changed = true;
+      granted += 1;
+    } catch (error) {
+      receipt.consumed_at = now;
+      receipt.consumed_outcome = "replay-authorization-failed";
+      receipt.replay_authorization_error = String(error.message || error).slice(0, 200);
+      receipt.evidence = evidence;
+      failed += 1;
+    }
     const temp = receiptPath + ".tmp-" + process.pid;
     fs.writeFileSync(temp, JSON.stringify(receipt, null, 2), "utf8");
     fs.renameSync(temp, receiptPath);
@@ -4595,11 +4690,22 @@ function reconcileRecoveredMediaJobs(now = new Date().toISOString()) {
   let changed = 0;
   for (const job of postprocessJobs.values()) {
     if (!job || !["queued", "retry"].includes(job.status) ||
-        job.retry_exhausted === true || !waitingReasons.has(String(job.last_error || "")) ||
         job.repair_execution || job.recovery_execution) continue;
+    const exhaustedTemporaryWait = job.status === "retry" && job.retry_exhausted === true &&
+      [job.media_source_refresh?.previous_error,
+        job.result?.vision_calendar?.result?.reason,
+        job.result?.calendar?.result?.reason].some((reason) =>
+        String(reason || "") === "temporary-new-messages-pending");
+    if (job.retry_exhausted === true && !exhaustedTemporaryWait) continue;
+    if (job.retry_exhausted !== true && !waitingReasons.has(String(job.last_error || ""))) continue;
     const source = verifiedManifestMiddleSource(job);
     if (!source) continue;
     const event = job.event || {};
+    // A priority yield describes scheduling. Seeing the same verified bytes
+    // again must not erase its delay or turn it into a media recovery.
+    if (!exhaustedTemporaryWait && job.last_error === "temporary-new-messages-pending" &&
+        event.media_file === source.file && event.media_file_sha256 === source.sha &&
+        event.media_captured_tier === source.tier && event.media_middle_pending === false) continue;
     const previousError = job.last_error;
     job.event = {
       ...event,
@@ -4615,6 +4721,33 @@ function reconcileRecoveredMediaJobs(now = new Date().toISOString()) {
       media_status: "ready",
       media_recovered: true,
     };
+    if (exhaustedTemporaryWait) {
+      // The original two attempts remain recorded. This source-verified,
+      // one-shot recovery gets its own execution lane and cannot consume a
+      // third ordinary retry or wake the Codex repair loop.
+      job.recovery_execution = {
+        fix_id: VERIFIED_MIDDLE_RECOVERY_FIX_ID,
+        job_id: job.id,
+        granted_at: now,
+        pending: true,
+        attempts: 0,
+        attempts_before: Number(job.attempts || 0),
+        previous_error: previousError,
+        previous_exhausted: true,
+        proof: {
+          ok: true,
+          fix_id: VERIFIED_MIDDLE_RECOVERY_FIX_ID,
+          job_id: job.id,
+          attempts: Number(job.attempts || 0),
+          last_error: previousError,
+          file_sha: source.sha,
+          message_key: String(source.record.message_key || source.record.id || ""),
+          captured_tier: source.tier,
+          source: "verified-media-manifest",
+        },
+      };
+      job.retry_exhausted = false;
+    }
     job.media_source_refresh = {
       at: now,
       reason: "manifest-middle-reconciled",
@@ -4634,6 +4767,27 @@ function reconcileRecoveredMediaJobs(now = new Date().toISOString()) {
     console.log("[wechat-ingest] reconciled recovered middle media=" + changed);
     schedulePostprocessWorker();
   }
+  return {changed};
+}
+
+function refreshStaleMiddlePaths() {
+  let changed = 0;
+  for (const job of postprocessJobs.values()) {
+    const event = job.event;
+    if (!["queued", "retry"].includes(job.status) || event?.media_kind !== "image" ||
+        !event.media_message_key || !(event.media_middle_pending === true ||
+        event.media_captured_tier === "thumbnail")) continue;
+    const source = verifiedManifestMiddleSource(job);
+    if (!source || source.sha === event.media_thumbnail_sha256) continue;
+    Object.assign(event, {
+      media_path: source.file, media_file: source.file, media_canonical_file: source.file,
+      media_file_sha256: source.sha, media_middle_sha256: source.sha,
+      media_captured_tier: source.tier, media_middle_pending: false,
+      media_status: "ready",
+    });
+    changed++;
+  }
+  if (changed) writePostprocessJobs();
   return {changed};
 }
 
@@ -4739,6 +4893,7 @@ async function processPostprocessJob(job, { apiBurst = false, postprocess = hand
   }
   activePostprocessIds.add(job.id);
   let executionId = "";
+  const idleRetry = isIdlePostprocessJob(job) && !repaired && !recovered;
   if (repaired) {
     job.repair_execution.pending = false;
     job.repair_execution.attempts = Number(job.repair_execution.attempts || 0) + 1;
@@ -4760,7 +4915,6 @@ async function processPostprocessJob(job, { apiBurst = false, postprocess = hand
   // attempt. It must not inherit the ordinary idle-retry cancellation gate:
   // that gate yields stale retries when new messages arrive, but applying it
   // here aborts the recovered image before vision/calendar processing runs.
-  const idleRetry = isIdlePostprocessJob(job) && !repaired && !recovered;
   job.execution_lane = apiBurst ? "api-burst" : (idleRetry ? "idle-retry" : "fresh");
   job.memory_status ??= "queued";
   job.status = "running";
@@ -4947,15 +5101,21 @@ async function processPostprocessJob(job, { apiBurst = false, postprocess = hand
 }
 
 function isMemoryPriorityYield(reason) {
-  return ["temporary-new-messages-pending", "phone-worker-busy"].includes(reason);
+  return ["temporary-new-messages-pending", "phone-worker-busy", "subscription-worker-busy", "provider-rate-limit-wait", "flash-http-429"].includes(reason);
 }
 
 const {FIX_ID: MEMORY_FIX_ID, CACHE_FIX_ID: MEMORY_CACHE_FIX_ID, memorySourceHash, memoryRepairPending, grantMemoryRepair, grantMemoryCacheRepair,
   successfulMemoryReceipt, memoryLifetimeAttempts} = require("./memory-repair");
 
+function memoryJobRetryAt(job, providerRetryAt) {
+  const retryAt = Number(job.memory_next_attempt_at_ms || 0);
+  if (job.memory_repair?.fix_id === MEMORY_CACHE_FIX_ID && memoryRepairPending(job)) return retryAt;
+  return Math.max(retryAt, providerRetryAt);
+}
+
 async function processMemoryJob(job, {
   postprocess = handlePeoplePostprocess, onFailure = triggerMemorySelfRepair,
-  receiptJobs = postprocessJobs,
+  receiptJobs = postprocessJobs, admitted = false,
 } = {}) {
   if (job.memory_status === "succeeded") return;
   // Recovery is reconciliation, not a new attempt; do it even after exhaustion.
@@ -4986,7 +5146,7 @@ async function processMemoryJob(job, {
   let ok = false, reason, result;
   try {
     const receipt = duplicate ? {ok: true, result: duplicate.memory_receipt.result} : await postprocess(job.event,
-      {cacheOnly: repaired && job.memory_repair.fix_id === MEMORY_CACHE_FIX_ID});
+      {cacheOnly: repaired && job.memory_repair.fix_id === MEMORY_CACHE_FIX_ID, admitted});
     ok = receipt === true || Boolean(receipt?.ok && receipt?.result?.ok);
     result = receipt === true ? {ok: true, status: "completed"} : receipt?.result;
     reason = receipt?.result?.reason || receipt?.reason || "memory-failed";
@@ -5087,22 +5247,22 @@ function schedulePostprocessWorker(delayMs = 0) {
   else setImmediate(start);
 }
 
-async function runPostprocessWorker() {
+async function runPostprocessWorker({processPrimary = processPostprocessJob} = {}) {
   if (postprocessWorkerRunning) return;
   postprocessWorkerRunning = true;
   let paused = false;
   const active = new Set();
-  const activeJobs = new Set();
+  let memoryActive = false;
   const stopped = () => fs.existsSync(POSTPROCESS_DRAIN_FILE);
 
-  const runMemoryJob = async (memoryJob) => {
+  const runMemoryJob = async (memoryJob, admitted) => {
     if (process.env.WECHAT_BACKGROUND_PROVIDER === "ollama" && !(await ollamaAvailable())) {
       paused = true;
       memoryJob.memory_next_attempt_at_ms = Date.now() + OLLAMA_PAUSE_RETRY_MS;
       writePostprocessJobs();
       return;
     }
-    await processMemoryJob(memoryJob);
+    await processMemoryJob(memoryJob, {admitted});
   };
 
   try {
@@ -5119,8 +5279,29 @@ async function runPostprocessWorker() {
       // Claim several jobs synchronously before awaiting any result. Fresh
       // arrivals are ranked ahead of idle retries by selectPostprocessJob().
       while (!stopped() && active.size < POSTPROCESS_NORMAL_CONCURRENCY) {
-        const selected = selectPostprocessJob([...postprocessJobs.values()], Date.now());
-        const job = selected.job;
+        const now = Date.now();
+        const jobs = [...postprocessJobs.values()];
+        const {job} = selectPostprocessJob(jobs, now);
+        // Use one existing slot for an overdue profile after a primary job
+        // gets a slot. Keep a single profile writer even when the pool is idle.
+        if (!memoryActive && (!job || active.size > 0)) {
+          const providerReady = memoryProviderRetryAt(now);
+          const memory = jobs.find(entry =>
+            (entry.memory_status === "queued" || memoryRepairPending(entry)) &&
+            entry.status !== "queued" && entry.status !== "running" &&
+            memoryJobRetryAt(entry, providerReady) <= now &&
+            (!job || Date.parse(entry.created_at) <= now - POSTPROCESS_IDLE_RETRY_MS));
+          if (memory) {
+            memoryActive = true;
+            const overdue = Date.parse(memory.created_at) <= now - POSTPROCESS_IDLE_RETRY_MS;
+            const task = runMemoryJob(memory, overdue).finally(() => {
+              memoryActive = false;
+              active.delete(task);
+            });
+            active.add(task);
+            continue;
+          }
+        }
         if (!job) break;
         if (pendingClarificationDelivery(job)) {
           await askClarification(job);
@@ -5135,28 +5316,13 @@ async function runPostprocessWorker() {
           break;
         }
         let task;
-        activeJobs.add(job);
-        task = processPostprocessJob(job).finally(() => {
+        task = processPrimary(job).finally(() => {
           active.delete(task);
-          activeJobs.delete(job);
         });
         active.add(task);
       }
 
-      if (!active.size) {
-        const selected = selectPostprocessJob([...postprocessJobs.values()], Date.now());
-        if (!selected.job && selected.idleUntil) break;
-        if (!selected.job) {
-          // People-card enrichment is lower priority than every calendar/
-          // message job and is kept independent from the normal pool.
-          const memoryJob = [...postprocessJobs.values()].find((entry) =>
-            (entry.memory_status === "queued" || memoryRepairPending(entry)) && entry.status !== "queued" &&
-            entry.status !== "running" && Number(entry.memory_next_attempt_at_ms || 0) <= Date.now());
-          if (!memoryJob) break;
-          await runMemoryJob(memoryJob);
-          continue;
-        }
-      }
+      if (!active.size) break;
 
       if (active.size) {
         // Keep a spare lane responsive while a calendar/recovery child is
@@ -5183,14 +5349,22 @@ async function runPostprocessWorker() {
       .filter((job) => job.status === "queued" || pendingClarificationDelivery(job))
       .map((job) => Number((pendingClarificationDelivery(job) ? job.clarification_next_attempt_at_ms : job.next_attempt_at_ms) || 0))
       .sort((a, b) => a - b)[0];
+    const now = Date.now();
+    const memoryProviderReadyAt = memoryProviderRetryAt(now);
     const memoryRetryAt = [...postprocessJobs.values()]
       .filter((job) => (job.memory_status === "queued" || memoryRepairPending(job)) && job.status !== "queued" && job.status !== "running")
-      .map((job) => Number(job.memory_next_attempt_at_ms || 0)).sort((a, b) => a - b)[0];
+      .map((job) => memoryJobRetryAt(job, memoryProviderReadyAt)).sort((a, b) => a - b)[0];
     const next = [retryAt, memoryRetryAt].filter((value) => value != null);
     if (next.length && !stopped()) {
-      const selection = selectPostprocessJob([...postprocessJobs.values()], Date.now());
+      const providerRetryAt = postprocessProviderRetryAt(now);
+      const wakeTimes = providerRetryAt > now
+        ? [retryAt == null ? undefined : Math.max(retryAt, providerRetryAt), memoryRetryAt]
+        : [selectPostprocessJob([...postprocessJobs.values()], now, {providerRetryAt}).idleUntil, ...next];
+      const wakeAt = wakeTimes
+        .filter((value) => Number.isFinite(value))
+        .reduce((earliest, value) => Math.min(earliest, value), Infinity);
       schedulePostprocessWorker(Math.max(paused ? OLLAMA_PAUSE_RETRY_MS : 0,
-        (selection.idleUntil || Math.min(...next)) - Date.now()));
+        wakeAt - now));
     }
   }
 }
@@ -5482,11 +5656,13 @@ function startServer() {
   loadPostprocessJobs();
   reconcileCodexRepairReceipts();
   reconcileRecoveredMediaJobs();
+  refreshStaleMiddlePaths();
   reconcileCompletedManifestEvidence();
   setInterval(() => reconcileCodexRepairReceipts(), 5000).unref();
   setInterval(() => {
     reconcileRecoveredMediaJobs();
     reconcileCompletedManifestEvidence();
+    refreshStaleMiddlePaths();
   }, 30000).unref();
   // Keep historical retry/repair work alive after the worker drains. This is
   // only a scheduler wake-up; it does not change provider concurrency.
@@ -5525,7 +5701,7 @@ module.exports = {
   terminalReplayInputVerified,
   runPythonPostprocess,
   repairPending, grantRepair, grantRootCauseRepair, grantProviderRetry, processPostprocessJob,
-  processMemoryJob, triggerMemorySelfRepair, memoryNoopResult, resolveMemoryNoop,
+  handlePeoplePostprocess, processMemoryJob, triggerMemorySelfRepair, memoryNoopResult, resolveMemoryNoop,
   selectPostprocessJob, postprocessProviderRetryAt,
   recoverStaleRunningPostprocessJobs,
   recoveryPending,
@@ -5561,6 +5737,7 @@ module.exports = {
   lookupMediaRecord,
   verifiedManifestMiddleSource,
   reconcileRecoveredMediaJobs,
+  refreshStaleMiddlePaths,
   resolveMediaContext,
   uploadedSpreadsheetQueryResult,
   uploadedSpreadsheetQuestion,
