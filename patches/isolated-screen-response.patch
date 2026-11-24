@@ -1,0 +1,32 @@
+--- a/skills/wechat-calendar/antigravity_screen.py
++++ b/skills/wechat-calendar/antigravity_screen.py
+@@ -122,4 +122,6 @@
+                 helper.write_json(store / "last-cli-output.json", {"stdout": stdout, "stderr": stderr, "returncode": process.returncode})
+                 envelope = json.loads(stdout)
++                if not isinstance(envelope, dict):
++                    raise ValueError("invalid-subscription-envelope")
+                 if process.returncode or envelope.get("status") != "SUCCESS" or envelope.get("denied_actions"):
+                     # Provider errors cannot become a negative relevance judgment.
+@@ -153,5 +155,8 @@
+             except ScreenProviderUnavailable:
+                 raise
+-            except (ValueError, FileNotFoundError):
++            except ValueError:
++                # A malformed response is evidence about this request alone.
++                raise ScreenProviderUnavailable("subscription-screen-invalid-response") from None
++            except FileNotFoundError:
+                 state["retry_after"] = time.time() + 600
+                 helper.write_json(state_path, state)
+--- a/skills/wechat-calendar/test_antigravity_screen.py
++++ b/skills/wechat-calendar/test_antigravity_screen.py
+@@ -52,6 +52,8 @@
+                     screen.screen(self.request(), store=tmp, runner=lambda *a, **kw: self.process(value, **extra),
+                                   quota_check=lambda *a: {"ok": True})
+-                with self.assertRaisesRegex(screen.ScreenProviderUnavailable, "subscription-screen-cooling-down"):
+-                    screen.screen(self.request(), store=tmp, runner=lambda *a, **kw: self.fail("must not launch"))
++                valid = {"relevance": "relevant", "reason": "verified fixture", "unchanged_event_uids": []}
++                result = screen.screen(self.request(), store=tmp,
++                                      runner=lambda *a, **kw: self.process(valid))
++                self.assertEqual(result["relevance"], "relevant")
+ 
+     def test_timeout_does_not_block_next_subscription_request(self):
