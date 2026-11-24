@@ -2694,7 +2694,10 @@ async function enrichEventMedia(cfg, event, msgRow) {
   if (kind === "image") {
     const existingKey = buildMediaMessageKey(event.talker, msgRow);
     existingManifest = loadManifestRows().findLast(row => (row.message_key || row.id) === existingKey);
-    if (existingManifest && !imageNeedsSourceWork(existingManifest, readImageDemands())) {
+    const existingFile = existingManifest?.file || existingManifest?.canonical_file || null;
+    const existingMiddleIsComplete = effectiveCapturedTier(existingManifest || {}) !== "middle" ||
+      !existingFile || !fs.existsSync(existingFile) || isCompleteRasterImage(existingFile);
+    if (existingManifest && existingMiddleIsComplete && !imageNeedsSourceWork(existingManifest, readImageDemands())) {
       // Re-polling a completed prescreen must not reset it to pending or
       // replace its bytes just because a better cache file has appeared.
       event.media_message_key = existingKey;
@@ -3140,40 +3143,74 @@ async function reconcileUnindexedWechatFiles(cfg, latestRows, now) {
   return [...bound, ...captured];
 }
 
+// The two active lookups may finish before the desktop cache receives the clip.
+const lateVideoMisses = new Map();
+
+function lateVideoSource(row) {
+  if (row.kind !== "video" || row.attachment_failure_reason !== "video-cache-not-found" ||
+      row.status !== "pending" || row.file || row.file_sha || !row.original_content ||
+      !row.message_create_time || !row.server_id || row.server_id === "0") return null;
+  const source = {local_type:43, local_id:row.local_id, server_id:row.server_id,
+    create_time:row.message_create_time, message_content:row.original_content};
+  return buildMediaMessageKey(row.talker, source) === row.message_key ? source : null;
+}
+
+// An MP4 may appear in a different month or grow in place. Only repeat a
+// missed local lookup when the inventory changes (or the process restarts).
+function videoCacheVersion(accountDir) {
+  const root = path.join(accountDir, "msg", "video");
+  const files = [];
+  try {
+    for (const month of fs.readdirSync(root, {withFileTypes:true})) {
+      if (!month.isDirectory()) continue;
+      const folder = path.join(root, month.name);
+      for (const entry of fs.readdirSync(folder, {withFileTypes:true})) {
+        if (!entry.isFile() || !/\.mp4$/i.test(entry.name)) continue;
+        const stat = fs.statSync(path.join(folder, entry.name), {bigint:true});
+        files.push(JSON.stringify([month.name, entry.name, String(stat.ino), String(stat.size),
+          String(stat.mtimeNs), String(stat.ctimeNs)]));
+      }
+    }
+  } catch { return null; } // The cache can move during enumeration.
+  return crypto.createHash("sha256").update(JSON.stringify([accountDir, files.sort()])).digest("hex");
+}
+
 async function retryMissingFileManifest(cfg, latestRows, now) {
   const recovered = [];
-  // Retry newest rows first so old failures can never block current messages.
-  const candidates = [...latestRows]
-    .filter((row) =>
-      row.source === "pc-hook" &&
-      ["file", "video"].includes(row.kind) &&
-      row.talker &&
-      Number(row.local_id || 0) > 0 &&
-      now - Number(row.ts || 0) >= 0 &&
-      now - Number(row.ts || 0) <= FILE_RETRY_MAX_AGE_MS &&
-      Number(row.attachment_retry_attempts || 0) < 2 &&
-      (!row.file || !fs.existsSync(row.file) || row.status === "missing" ||
-        row.attachment_failure_class === "attachment_unresolved" ||
-        row.vision_state === "waiting_media")
-    )
-    .sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0))
-    .slice(0, FILE_RECONCILE_BATCH_LIMIT);
-  if (!candidates.length) return recovered;
+  const unresolved = [...latestRows].filter(row => row.source === "pc-hook" &&
+    ["file", "video"].includes(row.kind) && row.talker && Number(row.local_id) > 0 &&
+    now >= Number(row.ts) && now - Number(row.ts) <= FILE_RETRY_MAX_AGE_MS);
+  const candidates = unresolved.filter(row => Number(row.attachment_retry_attempts || 0) < 2 &&
+    (!row.file || !fs.existsSync(row.file) || row.status === "missing" ||
+     row.attachment_failure_class === "attachment_unresolved" || row.vision_state === "waiting_media" ||
+     (row.kind === "video" && row.file && row.file_sha && !row.media_method &&
+      row.status === "pending" && row.vision_state === "retry")))
+    .sort((a, b) => b.ts - a.ts).slice(0, FILE_RECONCILE_BATCH_LIMIT);
+  const late = unresolved.filter(row => Number(row.attachment_retry_attempts) >= 2 && lateVideoSource(row));
+  const pendingKeys = new Set(late.map(row => row.message_key));
+  for (const key of lateVideoMisses.keys()) if (!pendingKeys.has(key)) lateVideoMisses.delete(key);
+  if (!candidates.length && !late.length) return recovered;
 
   const root = await getFilesRoot(cfg);
   const wxid = cfg.wechat_account_wxid || cfg.self_wxid || cfg.pc_login_wxid || "";
   const accountDir = findAccountDir(root, wxid);
   if (!accountDir) return recovered;
+  const version = late.length ? videoCacheVersion(accountDir) : null;
+  if (version) {
+    candidates.push(...late.filter(row => lateVideoMisses.get(row.message_key) !== version)
+      .slice(0, FILE_RECONCILE_BATCH_LIMIT));
+  }
 
   for (const row of candidates) {
     const key = row.id || row.message_key || `${row.talker}|${row.local_id}|${row.ts}`;
     const retry = fileRetryState.get(key) || { attempts: Number(row.attachment_retry_attempts || 0), nextAt: 0 };
-    if (now < retry.nextAt || retry.attempts >= 2) continue;
+    const passiveSource = Number(row.attachment_retry_attempts) >= 2 ? lateVideoSource(row) : null;
+    if (!passiveSource && (now < retry.nextAt || retry.attempts >= 2)) continue;
     let resources = [];
     let result;
     try {
       resources = row.kind === "video" ? [] : await fetchMessageResources(cfg, row.talker, Number(row.local_id));
-      const msgRow = await fetchExactMessageRow(cfg, row);
+      const msgRow = passiveSource || await fetchExactMessageRow(cfg, row);
       const {baseType} = decodeMessageType(msgRow.local_type);
       const exactMetadata = baseType === 49 ? attachmentMetadata(msgRow.message_content) : {};
       if (row.kind === "video" && mediaKind(msgRow.local_type) === "video") {
@@ -3189,6 +3226,10 @@ async function retryMissingFileManifest(cfg, latestRows, now) {
         break;
       }
       result = { ok: false, reason: `resolver-exception:${err?.message || String(err)}` };
+    }
+    if (passiveSource && !result?.ok) {
+      if (result?.reason === "video-cache-not-found") lateVideoMisses.set(row.message_key, version);
+      continue;
     }
     if (!result?.ok) {
       const attempts = retry.attempts + 1;
@@ -3512,6 +3553,8 @@ async function retryImageSources(cfg, latestByMessage, now, force) {
       const month = monthDirFromTs(Math.floor(Number(row.ts || 0) / 1000));
       const paths = resolveImageAttachPaths(accountDir, row.talker, row.image_hash, month, [], true);
       const ct = Number(row.message_create_time || Math.floor(Number(row.ts || 0) / 1000));
+      const waitingForMiddle = row.middle_pending === true &&
+        effectiveCapturedTier(row) === 'thumbnail';
       const sources = [paths?.extraWsl,
         ...["mid_temp_convert", "mid_temp"].map(suffix =>
           resolveImageCacheTempPath(accountDir, row.talker, row.local_id, ct, suffix)?.wsl),
@@ -3527,6 +3570,15 @@ async function retryImageSources(cfg, latestByMessage, now, force) {
         let stat;
         try { stat = await fs.promises.stat(src); } catch { continue; }
         if (!stat.isFile() || stat.size < 32) continue;
+        // A pending-middle row can have only the thumbnail source. It proves
+        // that bytes exist, but must not block the native middle request.
+        const thumbnailOnly = waitingForMiddle && /_t\.dat$/i.test(path.basename(src));
+        const expectedMiddle = Number(row.middle_expected_bytes || 0);
+        const sourceTooSmall = waitingForMiddle && expectedMiddle > 0 &&
+          stat.size < Math.floor(expectedMiddle * 0.8);
+        const incompleteRaster = waitingForMiddle &&
+          /\.(?:jpe?g|png)$/i.test(src) && !isCompleteRasterImage(src);
+        if (thumbnailOnly || sourceTooSmall || incompleteRaster) continue;
         sourcePresent = true;
         const key = `${identity}|${src}`;
         const signature = `${stat.size}|${stat.mtimeMs}`;
@@ -3552,8 +3604,6 @@ async function retryImageSources(cfg, latestByMessage, now, force) {
           } catch {}
         }
         const spam = row.content_pool === 'spam' || resolveTalkerPolicy(row.talker).content_pool === 'spam';
-        const waitingForMiddle = row.middle_pending === true &&
-          effectiveCapturedTier(row) === 'thumbnail';
         if (needsNativeMiddle(row, {
           requested: waitingForMiddle || important || row.durable_retry_source === true,
           coarse,

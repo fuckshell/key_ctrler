@@ -4501,6 +4501,35 @@ function enqueuePostprocess(event) {
           console.error(`[wechat-ingest] middle refresh rejected request=${prior.id} kind=${error.code || error.name}`);
         }
       }
+    // A late video source can arrive after the original inference exhausted.
+    // Refresh the existing job with verified bytes and let its normal worker
+    // finish the same message. This preserves the message identity and queue
+    // record while making the recovered path visible downstream.
+    if (prior.status === "retry" && event.media_kind === "video" &&
+        event.media_file_sha256 && event.media_file_sha256 !== prior.event?.media_file_sha256) {
+      prior.event = {
+        ...prior.event,
+        media_path: event.media_path || event.media_file,
+        media_file: event.media_file || event.media_path,
+        media_canonical_file: event.media_canonical_file || event.media_file || event.media_path,
+        media_file_sha256: event.media_file_sha256,
+        media_status: "ready",
+        media_recovered: true,
+      };
+      prior.media_source_refresh = {
+        at: new Date().toISOString(),
+        reason: "late-video-source-recovered",
+        previous_error: prior.last_error || null,
+        file_sha256: event.media_file_sha256,
+      };
+      prior.status = "queued";
+      prior.retry_exhausted = false;
+      prior.last_error = null;
+      prior.next_attempt_at_ms = 0;
+      prior.updated_at = new Date().toISOString();
+      writePostprocessJobs();
+      schedulePostprocessWorker();
+    }
       return { job: prior, duplicate: true };
     }
   }
