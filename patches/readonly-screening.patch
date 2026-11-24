@@ -1,0 +1,70 @@
+--- a/skills/wechat-calendar/context_calendar_pipeline.py
++++ b/skills/wechat-calendar/context_calendar_pipeline.py
+@@ -1114,7 +1114,10 @@
+         except Exception as exc:
+             from inference import InferenceYield
+             if isinstance(exc, InferenceYield):
+-                return inference_yield_result(exc)
++                result = inference_yield_result(exc)
++                if result["reason"] in {"provider-rate-limit-wait", "subscription-worker-busy", "phone-worker-busy"}:
++                    result["stage"] = "readonly-screening"
++                return result
+             return {"ok": False, "retryable": True, "reason": "screening-unavailable",
+                     "detail": type(exc).__name__, "path": "calendar-screen"}
+         if screening.get("relevance") == "irrelevant":
+--- a/skills/wechat-calendar/antigravity_screen.py
++++ b/skills/wechat-calendar/antigravity_screen.py
+@@ -148,8 +148,7 @@
+                         pass
+                     process.communicate()
+                 helper.write_json(store / "last-error.json", {"error": "timeout", "timeout": timeout})
+-                state["retry_after"] = time.time() + 600
+-                helper.write_json(state_path, state)
++                # The child timed out locally. Its fallback must not block unrelated CLI requests.
+                 raise ScreenProviderUnavailable("subscription-screen-timeout") from None
+             except ScreenProviderUnavailable:
+                 raise
+--- a/skills/wechat-antigravity/inference.py
++++ b/skills/wechat-antigravity/inference.py
+@@ -43,7 +43,7 @@
+ _priority_cache_value = None
+
+
+-def _queue_priority_snapshot():
++def _queue_priority_snapshot(*, retry_replaced=True):
+     """Cache only priority facts, invalidating on every atomic queue revision.
+
+     Polling the 38MB job journal twice for every skipped repair used whole CPU
+@@ -87,7 +87,9 @@
+         after_key = (str(queue), after.st_dev, after.st_ino, after.st_size,
+                      after.st_mtime_ns, after.st_ctime_ns)
+         if after_key != key:
+-            return None
++            # A receipt commit also replaces the queue file. Check the new
++            # snapshot before interrupting an in-flight read for fresh work.
++            return _queue_priority_snapshot(retry_replaced=False) if retry_replaced else None
+         value = {'running': running, 'due_ms': due, 'latest': latest}
+         _priority_cache_key, _priority_cache_value = key, value
+         return value
+@@ -268,6 +270,8 @@
+         if helper.quota_block_active(state):
+             raise InferenceUnavailable('subscription-quota-blocked')
+         if state.get('retry_after', 0) > time.time():
++            if not state.get('blocked') and (state.get('quota') or {}).get('ok') is False:
++                raise InferenceYield('provider-rate-limit-wait')
+             raise InferenceUnavailable('subscription-cooling-down')
+         if not (state.get('quota') or {}).get('ok') or state.get('quota_checked_at', 0) + 600 <= time.time() or state.get('model') != model:
+             quota = quota_check(binary, model, store, env)
+@@ -342,10 +346,8 @@
+                     except ProcessLookupError:
+                         pass
+                     process.communicate()
+-                recovered = _recover_network('subscription-timeout')
+-                state['retry_after'] = time.time() + 30
+-                state['cooldown_reason'] = 'network-recovery' if recovered else 'subscription-timeout'
+-                helper.write_json(state_path, state)
++                # A single slow read says nothing about quota or other requests.
++                helper.write_json(store / 'last-error.json', {'error': 'timeout', 'timeout': timeout})
+                 raise InferenceUnavailable('subscription-timeout') from None
+             except (OSError, ValueError, KeyError, TypeError, InferenceUnavailable) as exc:
+                 network = _network_failure(stdout if 'stdout' in locals() else '', stderr if 'stderr' in locals() else '', exc)

@@ -4964,6 +4964,20 @@ async function processPostprocessJob(job, { apiBurst = false, postprocess = hand
       // A successful execution is terminal. Normalize stale retry/self-repair
       // markers while preserving their nested history for audit.
       normalizeSuccessfulPostprocess(job, job.updated_at);
+    } else if (!repaired && !recovered && !result.vision_calendar &&
+        ["provider-rate-limit-wait", "subscription-worker-busy", "phone-worker-busy"].includes(check.reason) &&
+        result.calendar?.result?.ok === false &&
+        result.calendar.result.reason === check.reason && result.calendar.result.stage === "readonly-screening") {
+      // Screening yielded before calendar execution. Preserve real failures and
+      // space out further admission checks while the provider remains unavailable.
+      job.status = "queued";
+      job.last_error = check.reason;
+      job.attempts = Math.max(0, job.attempts - 1);
+      // A fallback API deadline is independent of the preferred subscription.
+      // Use the normal retry interval unless both providers report a block.
+      const now = Date.now();
+      job.next_attempt_at_ms = Math.max(now + POSTPROCESS_RETRY_BASE_MS, memoryProviderRetryAt(now));
+      delete job.completed_at;
     } else if (check.reason === "temporary-new-messages-pending") {
       job.status = "queued";
       job.last_error = check.reason;
