@@ -1,0 +1,10 @@
+--- a/skills/wechat-media/vision_pipeline.py
++++ b/skills/wechat-media/vision_pipeline.py
+@@ -1068,5 +1068,6 @@
+         if subscription_only:
+             from inference import infer as reader
+-        value = reader(prompt, image=path, schema=TABLE_OCR_SCHEMA, timeout=120)
++        # A full table may take several minutes to transcribe on the subscription.
++        value = reader(prompt, image=path, schema=TABLE_OCR_SCHEMA, timeout=360)
+         provider = getattr(value, "inference_provider", provider)
+         model = getattr(value, "inference_model", model)
