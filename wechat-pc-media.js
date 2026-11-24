@@ -558,7 +558,7 @@ function decompressMsgContentHex(hex) {
       timeout: 8000,
       stdio: ["ignore", "pipe", "pipe"],
     }).trim();
-    return out && (out.includes("<msg") || out.includes("aeskey")) ? out : null;
+    return out && (out.includes("<msg") || out.includes("<sysmsg") || out.includes("aeskey")) ? out : null;
   } catch {
     return null;
   }
@@ -3368,9 +3368,11 @@ function loadDurableRetryImageRows() {
       .filter(job => {
         const event = job?.event || {};
         return ["retry", "queued"].includes(String(job?.status || "")) &&
-          String(job?.last_error || "") === "image-tier-not-ready" &&
-          event.media_kind === "image" && event.media_middle_pending === true &&
-          /^[a-f0-9]{64}$/i.test(String(event.media_file_sha256 || ""));
+          ["image-tier-not-ready", "no-image-file", "waiting-native-middle-cache"].includes(String(job?.last_error || "")) &&
+          event.media_kind === "image" &&
+          (event.media_status === "waiting_native_middle_cache" ||
+           (event.media_middle_pending === true &&
+            /^[a-f0-9]{64}$/i.test(String(event.media_file_sha256 || ""))));
       })
       .map(job => {
         const event = job.event || {};
@@ -3399,11 +3401,11 @@ function loadDurableRetryImageRows() {
           path_hint: event.media_path || "",
           file_sha: fileSha,
           thumbnail_sha256: String(event.media_thumbnail_sha256 || fileSha).toLowerCase(),
-          captured_tier: event.media_captured_tier || "thumbnail",
+          captured_tier: event.media_captured_tier || (fileSha ? "thumbnail" : null),
           middle_pending: true,
           image_hash: event.media_image_hash || "",
-          // This row came from a bounded, already-failed image-tier gate. It
-          // may request one native middle submission without replaying vision.
+          // A waiting job is a candidate for source reconciliation. Its
+          // retry marker alone never authorizes a download or recognition.
           durable_retry_source: true,
           retry_attempts: Number(job.attempts || 0),
         };
@@ -3449,6 +3451,7 @@ function imageNeedsSourceWork(row, demands) {
   // A question can reuse/review those bytes without reopening acquisition.
   const local = row.canonical_file || row.file;
   if (effectiveCapturedTier(row) === "middle" && local && fs.existsSync(local)) return false;
+  if (row.source_recall?.kind === "wechat-revokemsg") return false;
   if (imageIsRequested(row, demands)) return true;
   // A postprocess job can fail after its coarse thumbnail screening has been
   // persisted as a completed manifest row.  The durable retry marker is the
@@ -3476,7 +3479,8 @@ function imageNeedsSourceWork(row, demands) {
 }
 
 function selectPassiveImageCandidates(rows, limit = Number(process.env.WECHAT_PASSIVE_IMAGE_SCAN_LIMIT || 64), demands = []) {
-  const eligible = [...rows].filter(row => row.source === "pc-hook" && row.kind === "image" && row.talker && (row.image_hash || row.cdn_middle_fileid) &&
+  const eligible = [...rows].filter(row => row.source === "pc-hook" && row.kind === "image" && row.talker && (row.image_hash || row.cdn_middle_fileid ||
+      (!row.file_sha && row.middle_pending && row.server_id && row.local_id && row.message_key)) &&
     imageNeedsSourceWork(row, demands) &&
     (!["filtered", "discarded"].includes(row.status) ||
       (row.middle_pending === true && effectiveCapturedTier(row) === 'thumbnail') ||
@@ -3489,7 +3493,15 @@ function selectPassiveImageCandidates(rows, limit = Number(process.env.WECHAT_PA
   const urgentBudget = Math.min(important.length, budget === 1 ? 0 : Math.max(1, Math.floor(budget / 2)));
   for (let i = 0; i < urgentBudget; i++) picked.push(important[(importantImageScanCursor + i) % important.length]);
   if (important.length) importantImageScanCursor = (importantImageScanCursor + urgentBudget) % important.length;
-  if (budget > 1 && !picked.includes(eligible.at(-1)) && picked.length < budget) picked.push(eligible.at(-1));
+  // Manifest order includes durable retry rows and late source updates, so
+  // its final row is not necessarily the newest message. Reserve one slot
+  // for the newest unresolved image to wake native middle acquisition before
+  // downstream media-wait attempts are exhausted.
+  const durable = eligible.find(row => row.durable_retry_source === true);
+  if (budget > 1 && durable && !picked.includes(durable) && picked.length < budget) picked.push(durable);
+  const newest = eligible.reduce((latest, row) =>
+    Number(row.ts || 0) > Number(latest?.ts || 0) ? row : latest, null);
+  if (budget > 1 && newest && !picked.includes(newest) && picked.length < budget) picked.push(newest);
   for (let i = 0; i < eligible.length && picked.length < budget; i++) {
     const row = eligible[passiveImageScanCursor % eligible.length];
     passiveImageScanCursor = (passiveImageScanCursor + 1) % eligible.length;
@@ -3526,7 +3538,88 @@ function decodeViaPythonAsync(src, dst) {
   });
 }
 
-async function retryImageSources(cfg, latestByMessage, now, force) {
+// A recall replaces the original row in place. Require the full, unrounded
+// identity and the structured system notice, never a type change alone.
+function imageRecallReceipt(row, current) {
+  if (Number(current?.local_type) !== 10000 || typeof row.server_id !== "string" ||
+      !/^[1-9][0-9]*$/.test(row.server_id) || current.server_id !== row.server_id ||
+      buildMediaMessageKey(row.talker, current) !== row.message_key ||
+      Number(current.local_id) !== Number(row.local_id) ||
+      Number(current.create_time) !== Number(row.message_create_time)) return null;
+  const xml = decompressMsgContentHex(current.message_content) || current.message_content || "";
+  if (!/<sysmsg\s+type=["']revokemsg["']\s*>\s*<revokemsg>/i.test(xml)) return null;
+  return {kind:"wechat-revokemsg", message_key:row.message_key, source_db:current.message_db};
+}
+
+// DrvFS may not forward Windows write notifications to inotify. Watch only
+// the exact pending paths by stat. The normal scan remains the restart path.
+const middleWatches = new Map();
+function watchMiddleArrival(key, sources, wake) {
+  if (!wake || middleWatches.has(key) || middleWatches.size >= 32) return;
+  const paths = [...new Set(sources.filter(Boolean))];
+  if (!paths.length) return;
+  let settling;
+  let generation = 0;
+  function stop() {
+    generation++;
+    for (const file of paths) fs.unwatchFile(file, changed);
+    clearTimeout(deadline);
+    clearTimeout(settling);
+    middleWatches.delete(key);
+  }
+  async function changed(stat) {
+    if (!stat.isFile() || stat.size < 32) return;
+    const observed = ++generation;
+    clearTimeout(settling);
+    try {
+      await wake(key);
+    } catch (err) {
+      console.warn("[wechat-bridge] source wake:", err.message);
+    }
+    if (observed !== generation) return;
+    // Start the stability interval after the first scan actually finishes.
+    settling = setTimeout(() => Promise.resolve(wake(key)).catch(err =>
+      console.warn("[wechat-bridge] stable source wake:", err.message)), 1500);
+    settling.unref?.();
+  }
+  const deadline = setTimeout(stop, 120000);
+  deadline.unref?.();
+  middleWatches.set(key, stop);
+  for (const file of paths) fs.watchFile(file, {persistent:false, interval:500}, changed);
+  // A rename may have completed between the scan and listener registration.
+  for (const file of paths) {
+    const stat = fs.statSync(file, {throwIfNoEntry:false});
+    if (stat?.isFile() && stat.size >= 32) { void changed(stat); break; }
+  }
+}
+
+function shouldResolveMiddle(row, requested) {
+  if (requested) return true;
+  if (!/^[a-f0-9]{64}$/.test(row.file_sha || "")) return false;
+  const spam = row.content_pool === "spam" || resolveTalkerPolicy(row.talker).content_pool === "spam";
+  if (spam || row.filtered_low_value || ["filtered", "discarded"].includes(row.status)) return false;
+  // A finished non-ad screen can retain the middle path for later questions
+  // without sending the image through recognition again.
+  if (hasCompletedThumbnailScreen(row)) return true;
+  try {
+    const key = crypto.createHash("sha256").update(row.file_sha).digest("hex");
+    const budget = JSON.parse(fs.readFileSync(path.join(WORKSPACE_WECHAT,
+      "state/image-inference-budget", key + ".json"), "utf8"));
+    return budget.waiting_source === true && budget.last_error === "image-tier-not-ready" &&
+      needsNativeMiddle(row, {coarse: budget.coarse_screening || {}});
+  } catch { return false; }
+}
+
+function hasCompletedThumbnailScreen(row) {
+  return row.status === "done" && row.vision_state === "done" && !row.vision_last_error &&
+    row.screening_decision === "summary_complete" && row.summary && row.middle_pending === true &&
+    effectiveCapturedTier(row) === "thumbnail" &&
+    Array.isArray(row.summary_evidence) && row.summary_evidence.length > 0 &&
+    ["gemini", "gemini-api", "antigravity-subscription"].includes(row.summary_provider) &&
+    /flash/i.test(row.summary_model || "");
+}
+
+async function retryImageSources(cfg, latestByMessage, now, force, onMiddleArrival) {
   if (imageRetryRunning || (!force && now - lastImageRetryAt < 9000)) return [];
   imageRetryRunning = true;
   lastImageRetryAt = now;
@@ -3537,6 +3630,7 @@ async function retryImageSources(cfg, latestByMessage, now, force) {
     if (!accountDir) return [];
     const demands = readImageDemands();
     const checks = readSourceChecks();
+    let missingLookupBudget = 2;
     const candidates = selectPassiveImageCandidates(latestByMessage.values(), undefined, demands);
     const ready = [];
     const upgraded = [];
@@ -3553,6 +3647,38 @@ async function retryImageSources(cfg, latestByMessage, now, force) {
       const month = monthDirFromTs(Math.floor(Number(row.ts || 0) / 1000));
       const paths = resolveImageAttachPaths(accountDir, row.talker, row.image_hash, month, [], true);
       const ct = Number(row.message_create_time || Math.floor(Number(row.ts || 0) / 1000));
+      // Initial capture can precede both thumbnail bytes and a sender's recall.
+      // Refresh from the same message before spending any recognition budget.
+      if (!row.file_sha && missingLookupBudget > 0 && row.middle_pending &&
+          now >= Number(checks["absent:" + identity]?.next_at || 0)) {
+        missingLookupBudget--;
+        checks["absent:" + identity] = {next_at: now + 60000};
+        try {
+          const current = await fetchExactMessageRow(cfg, {...row, kind:undefined});
+          const recall = imageRecallReceipt(row, current);
+          if (recall) {
+            appendManifest({...row, status:"withdrawn", vision_state:"withdrawn",
+              source_recall:recall, middle_pending:false});
+            continue;
+          }
+          if (Number(current.local_type) === IMAGE_TYPE &&
+              buildMediaMessageKey(row.talker, current) === identity) {
+            const result = await materializeImage(cfg, accountDir, row.talker, current,
+              await fetchMessageResources(cfg, row.talker, row.local_id));
+            if (result.ok) {
+              const fresh = stampImageFileIdentity({...row, ...result, status:"pending",
+                vision_state:"retry", attachment_stage:"materialized", attachment_failure_reason:null,
+                attachment_failure_class:null, media_error:null, vision_last_error:null});
+              appendManifest(fresh);
+              if (Number(row.vision_attempts || 0) < 2) triggerDistill(identity, fresh.file_sha);
+              upgraded.push(fresh);
+              continue;
+            }
+          }
+        } catch (err) {
+          console.warn("[wechat-bridge] missing image lookup:", err.code || err.name);
+        }
+      }
       const waitingForMiddle = row.middle_pending === true &&
         effectiveCapturedTier(row) === 'thumbnail';
       const sources = [paths?.extraWsl,
@@ -3563,6 +3689,11 @@ async function retryImageSources(cfg, latestByMessage, now, force) {
       for (const hint of [row.source_dat, row.passive_upgrade_source_path]) {
         if (hint && path.basename(hint) === row.image_hash + ".dat") sources.push(hint);
       }
+      const wantsMiddle = shouldResolveMiddle(row, important);
+      // A pre-existing file is subject to the same screening decision as a
+      // later file notification. Never run a second read for an ad.
+      if (waitingForMiddle && !wantsMiddle) continue;
+      if (wantsMiddle) watchMiddleArrival(identity, sources, onMiddleArrival);
       // Exact native middle cache and typed Hook middle copies only.
       if (important) checks[`request:${identity}`] = { state: "waiting-native-middle-cache", target_tier: "middle" };
       let sourcePresent = false;
@@ -3591,36 +3722,18 @@ async function retryImageSources(cfg, latestByMessage, now, force) {
         if (!imageSourceCheckReady(check, signature, now)) continue;
         ready.push({ row, src, stat, key, signature, important, check });
       }
-      if (!sourcePresent && nativeBudget > 0) {
-        let coarse = {};
-        // The persisted coarse decision must belong to these exact bytes.
-        const sha = row.file_sha;
-        if (/^[a-f0-9]{64}$/.test(sha || '') && effectiveCapturedTier(row) !== 'middle') {
-          try {
-            const budgetKey = crypto.createHash('sha256').update(sha).digest('hex');
-            const budget = JSON.parse(fs.readFileSync(path.join(WORKSPACE_WECHAT,
-              'state/image-inference-budget', budgetKey + '.json'), 'utf8'));
-            if (budget.waiting_source && budget.last_error === 'image-tier-not-ready') coarse = budget.coarse_screening || {};
-          } catch {}
-        }
-        const spam = row.content_pool === 'spam' || resolveTalkerPolicy(row.talker).content_pool === 'spam';
-        if (needsNativeMiddle(row, {
-          requested: waitingForMiddle || important || row.durable_retry_source === true,
-          coarse,
-          spam,
-        })) {
-          let contactedNative = false;
-          await requestNativeMiddle(row, {
-            stateDir: path.join(WORKSPACE_WECHAT, 'state/native-middle-receipts'), now,
-            request: body => {
-              contactedNative = true;
-              return hookRequest(cfg, '/TriggerDownload', body, {timeoutMs: 3500});
-            },
-          });
-          if (contactedNative) nativeBudget -= 1;
-          // A submit receipt is not source completion. The existing stable
-          // bytes/decrypt/SHA/binding checks above must still pass next time.
-        }
+      if (!sourcePresent && wantsMiddle && nativeBudget > 0) {
+        let contactedNative = false;
+        await requestNativeMiddle(row, {
+          stateDir: path.join(WORKSPACE_WECHAT, 'state/native-middle-receipts'), now,
+          request: body => {
+            contactedNative = true;
+            return hookRequest(cfg, '/TriggerDownload', body, {timeoutMs: 3500});
+          },
+        });
+        if (contactedNative) nativeBudget -= 1;
+        // A submit receipt is not source completion. The existing stable
+        // bytes/decrypt/SHA/binding checks above must still pass next time.
       }
     }
     // Waiting changed sources are also fair: repeatedly arriving important
@@ -3681,8 +3794,10 @@ async function retryImageSources(cfg, latestByMessage, now, force) {
       if (similarity !== null && similarity < 0.78) { fail(); continue; }
       // Recognition results belong to bytes; attempts and failure history
       // belong to the message and must survive source acquisition.
+      const pathOnly = hasCompletedThumbnailScreen(row);
+      if (pathOnly) candidate.summary_source_sha256 = row.summary_source_sha256 || row.file_sha;
       for (const field of Object.keys(candidate)) {
-        if (canon.file_sha !== row.file_sha &&
+        if (!pathOnly && canon.file_sha !== row.file_sha &&
             !["vision_attempts", "vision_last_attempt_at", "vision_last_error"].includes(field) &&
             (/^(summary|vision_|schedule_ocr)/.test(field) || ["tags", "summarized_at"].includes(field))) candidate[field] = null;
       }
@@ -3691,7 +3806,7 @@ async function retryImageSources(cfg, latestByMessage, now, force) {
       const replayBlocked = Number(row.vision_attempts || 0) >= 2 ||
         row.vision_state === "repair_required" || !!row.backlog_api_job ||
         row.completion_validation_failure?.automatic_replay_blocked === true;
-      if (!completedSameBytes) Object.assign(candidate, { status: "pending",
+      if (!completedSameBytes && !pathOnly) Object.assign(candidate, { status: "pending",
         vision_state: replayBlocked ? "repair_required" : "retry",
         vision_next_retry_at: null });
       Object.assign(candidate, { optional_hd_upgrade: false,
@@ -3699,10 +3814,11 @@ async function retryImageSources(cfg, latestByMessage, now, force) {
         passive_upgrade_source_mtime_ms: stat.mtimeMs, passive_upgrade_at: new Date(now).toISOString(),
         binding_basis: "exact_image_hash_or_fileid_new_file" });
       appendManifest(candidate);
+      middleWatches.get(row.message_key || row.id)?.();
       const completedReliableSummary = row.status === "done" && row.summary &&
         Number(row.summary_confidence || 0) >= 0.78;
-      if (!completedSameBytes && !completedReliableSummary) {
-        triggerDistill();
+      if (!pathOnly && !completedSameBytes && !completedReliableSummary && !replayBlocked) {
+        triggerDistill(row.message_key || row.id, canon.file_sha);
       }
       // Reliable completed work must not be replayed simply for an optional
       // source upgrade. Unresolved work keeps its existing durable queue.
@@ -3710,7 +3826,7 @@ async function retryImageSources(cfg, latestByMessage, now, force) {
       // budget. Ingest independently verifies the exact source and the prior
       // pre-calendar failure before granting one recovery; this notification
       // itself never resets attempts or authorizes a calendar replay.
-      if (!(row.status === "done" && row.summary && Number(row.summary_confidence || 0) >= 0.78)) upgraded.push(candidate);
+      if ((!pathOnly && !completedReliableSummary) || row.durable_retry_source) upgraded.push(candidate);
       checks[key] = { ...check, signature, attempts, done: true, middle_metadata_version: 3, next_at: 0 };
       console.log(`[wechat-bridge] exact image source upgraded local=${row.local_id} tier=${tier.tier} bytes=${bytes}`);
     }
@@ -3719,12 +3835,14 @@ async function retryImageSources(cfg, latestByMessage, now, force) {
   } finally { imageRetryRunning = false; }
 }
 
-async function retryHdPendingManifest(cfg, { force = false, passiveOnly = false, filesOnly = false } = {}) {
+async function retryHdPendingManifest(cfg, { force = false, passiveOnly = false, filesOnly = false, messageKey, onMiddleArrival } = {}) {
   const now = Date.now();
   const latestByMessage = new Map();
   for (const row of loadManifestRows()) latestByMessage.set(row.id || row.message_key || [row.talker,row.local_id,row.ts].join("|"), row);
   mergeDurableRetryImageRows(latestByMessage);
-  const upgraded = filesOnly ? [] : await retryImageSources(cfg, latestByMessage, now, force);
+  const selected = messageKey ? new Map([...latestByMessage].filter(([,row]) =>
+    (row.message_key || row.id) === messageKey)) : latestByMessage;
+  const upgraded = filesOnly ? [] : await retryImageSources(cfg, selected, now, force, onMiddleArrival);
   if (passiveOnly || fileRecoveryRunning || (!force && now - lastHdRetryAt < HD_RETRY_COOLDOWN_MS)) return upgraded;
   fileRecoveryRunning = true;
   lastHdRetryAt = now;

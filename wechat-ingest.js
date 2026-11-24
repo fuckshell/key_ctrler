@@ -4467,7 +4467,13 @@ function enqueuePostprocess(event) {
   if (!event.media_recovered && activePostprocessJob?.execution_lane === "idle-retry") activePostprocessCancelRequested = true;
   const id = postprocessJobKey(event);
   const existing = postprocessJobs.get(id);
-  if (existing) return { job: existing, duplicate: true };
+  if (existing) {
+    if (event.media_recovered && event.media_kind === "image" && event.media_file_sha256 &&
+        event.media_message_key && event.media_message_key === existing.event?.media_message_key) {
+      reconcileRecoveredMediaJobs(new Date().toISOString(), existing);
+    }
+    return {job: existing, duplicate: true};
+  }
   // Source recovery may change the SHA/path, but cannot create a fresh retry
   // budget for an already accepted message or replay its calendar writes.
   if (event.media_recovered && event.media_message_key) {
@@ -4480,6 +4486,10 @@ function enqueuePostprocess(event) {
       return key === event.media_message_key;
     });
     if (prior) {
+      if (event.media_kind === "image" && event.media_file_sha256 &&
+          reconcileRecoveredMediaJobs(new Date().toISOString(), prior).changed) {
+        return {job:prior, duplicate:true};
+      }
       if (["queued", "retry"].includes(prior.status) && !prior.repair_execution &&
           !prior.media_source_refresh && prior.event?.media_file_sha256 !== event.media_file_sha256 &&
           ["ocr-cache-empty", "waiting-media-upgrade", "image-tier-not-ready", "waiting-media"].includes(prior.last_error)) {
@@ -4615,6 +4625,20 @@ function appendPostprocessApiBurstRecord(record) {
   }
 }
 
+function awaitingFirstImage(job) {
+  const e = job.event || {};
+  return e.media_kind === "image" && !!e.media_message_key &&
+    e.media_status === "waiting_native_middle_cache" && !e.media_file_sha256 &&
+    (!job.last_error || job.last_error === "no-image-file");
+}
+
+function imageFailedBeforeCalendar(job) {
+  const failed = job.result?.vision_calendar?.result;
+  return job.result?.calendar === false && job.result?.pending === true &&
+    failed?.ok === false && failed.reason === "no-image-file" &&
+    failed.message_key === job.event.media_message_key && !failed.session_key;
+}
+
 function postprocessWaitingForMiddle(job) {
   // The media worker already paid for a coarse read of this exact source.
   // Waiting for different bytes is not another calendar execution. Keep the
@@ -4627,6 +4651,11 @@ function postprocessWaitingForMiddle(job) {
   // Do not let stale event metadata turn a completed read into another media
   // wait (or consume the bounded wait budget).
   if (postprocessHasCompletedManifestEvidence(job)) return false;
+  if (awaitingFirstImage(job)) {
+    // Give the source resolver time to capture the first bytes or observe
+    // a recall. A genuinely unavailable source still surfaces for repair.
+    return Date.now() - Date.parse(job.created_at) < 180000;
+  }
   const sha = event.media_file_sha256;
   // Older recovered events omitted the tier. The SHA-scoped persisted coarse
   // read below is still evidence for those bytes. Explicit non-thumbnail
@@ -4716,19 +4745,58 @@ function verifiedManifestMiddleSource(job) {
   return {record, file, sha: actualSha, tier};
 }
 
-function reconcileRecoveredMediaJobs(now = new Date().toISOString()) {
+function reconcileRecoveredMediaJobs(now = new Date().toISOString(), onlyJob = null) {
   const waitingReasons = new Set(["image-tier-not-ready", "temporary-new-messages-pending"]);
   let changed = 0;
-  for (const job of postprocessJobs.values()) {
+  for (const job of onlyJob ? [onlyJob] : postprocessJobs.values()) {
     if (!job || !["queued", "retry"].includes(job.status) ||
         job.repair_execution || job.recovery_execution) continue;
+    const missing = awaitingFirstImage(job);
+    if (missing && (!job.attempts || imageFailedBeforeCalendar(job))) {
+      const e = job.event;
+      const row = lookupMediaRecord(e.talker, e.ts, e.content, e);
+      if (row?.status === "withdrawn" && row.message_key === e.media_message_key &&
+          row.source_recall?.kind === "wechat-revokemsg" &&
+          row.source_recall.message_key === row.message_key) {
+        job.source_recall = {...row.source_recall, previous_status:job.status,
+          previous_exhausted:job.retry_exhausted === true, at:now};
+        job.status = "withdrawn";
+        job.updated_at = job.completed_at = now;
+        job.retry_exhausted = false;
+        changed++;
+        continue;
+      }
+      // First thumbnail arrived after initial delivery. Let the original
+      // job do its first screen, with the same identity and attempt budget.
+      if (job.status === "queued" && !job.retry_exhausted && row?.message_key === e.media_message_key &&
+          row.captured_tier === "thumbnail" && row.file_sha && row.file_sha === row.thumbnail_sha256) {
+        const file = resolveMediaFilePath(row);
+        let sha;
+        try { sha = crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex"); }
+        catch { continue; }
+        if (sha !== row.file_sha) continue;
+        Object.assign(e, {media_file:file, media_path:file, media_canonical_file:file,
+          media_file_sha256:sha, media_thumbnail_sha256:sha, media_middle_pending:true,
+          media_captured_tier:"thumbnail", media_status:"ready"});
+        job.last_error = null;
+        job.next_attempt_at_ms = 0;
+        job.updated_at = now;
+        changed++;
+        continue;
+      }
+    }
     const exhaustedTemporaryWait = job.status === "retry" && job.retry_exhausted === true &&
       [job.media_source_refresh?.previous_error,
         job.result?.vision_calendar?.result?.reason,
         job.result?.calendar?.result?.reason].some((reason) =>
         String(reason || "") === "temporary-new-messages-pending");
-    if (job.retry_exhausted === true && !exhaustedTemporaryWait) continue;
-    if (job.retry_exhausted !== true && !waitingReasons.has(String(job.last_error || ""))) continue;
+    const exhaustedSourceWait = exhaustedTemporaryWait || (missing &&
+      job.retry_exhausted === true && imageFailedBeforeCalendar(job));
+    if (job.retry_exhausted === true && !exhaustedSourceWait) continue;
+    const beforeFirstAttempt = job.status === "queued" && !job.attempts && !job.last_error &&
+      job.event?.media_kind === "image" && job.event.media_middle_pending === true;
+    if (!missing && !beforeFirstAttempt && job.retry_exhausted !== true &&
+        !waitingReasons.has(String(job.last_error || ""))) continue;
     const source = verifiedManifestMiddleSource(job);
     if (!source) continue;
     const event = job.event || {};
@@ -4752,7 +4820,7 @@ function reconcileRecoveredMediaJobs(now = new Date().toISOString()) {
       media_status: "ready",
       media_recovered: true,
     };
-    if (exhaustedTemporaryWait) {
+    if (exhaustedSourceWait) {
       // The original two attempts remain recorded. This source-verified,
       // one-shot recovery gets its own execution lane and cannot consume a
       // third ordinary retry or wake the Codex repair loop.

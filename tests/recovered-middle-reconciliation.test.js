@@ -173,3 +173,42 @@ test("refreshes only the verified source and preserves downstream failures", () 
     assert.deepEqual(saved[field], job[field]);
   }
 });
+
+for (const withdrawn of [false, true]) {
+  test(withdrawn ? "exact recall closes the original retry once" : "late first thumbnail wakes the original job once", () => {
+    const id = withdrawn ? 51 : 50;
+    const key = "chat@chatroom|" + id + "|1795050050|server-" + id;
+    const job = imageJob("first-source-" + id, key, withdrawn ? "no-image-file" : null, null, id);
+    job.attempts = withdrawn ? 2 : 0;
+    job.status = withdrawn ? "retry" : "queued";
+    job.retry_exhausted = withdrawn;
+    job.event.media_status = "waiting_native_middle_cache";
+    const row = {talker:job.event.talker, kind:"image", local_id:id, message_key:key};
+    if (withdrawn) {
+      job.result = {calendar:false, pending:true, vision_calendar:{result:{
+        ok:false, reason:"no-image-file", message_key:key,
+      }}};
+      Object.assign(row, {status:"withdrawn", source_recall:{kind:"wechat-revokemsg", message_key:key}});
+    } else {
+      const file = path.join(root, "late-thumb.jpg");
+      fs.writeFileSync(file, "late thumbnail fixture");
+      const digest = sha(fs.readFileSync(file));
+      Object.assign(row, {file, status:"pending", captured_tier:"thumbnail", file_sha:digest, thumbnail_sha256:digest});
+    }
+    writeManifest([row]);
+    writeJobs([job]);
+    assert.deepEqual(reconcileRecoveredMediaJobs(), {changed:1});
+    assert.deepEqual(reconcileRecoveredMediaJobs(), {changed:0});
+    const saved = JSON.parse(fs.readFileSync(process.env.WECHAT_POSTPROCESS_JOB_FILE)).jobs.find(j => j.id === job.id);
+    assert.equal(saved.attempts, job.attempts);
+    if (withdrawn) {
+      assert.equal(saved.status, "withdrawn");
+      assert.equal(saved.last_error, job.last_error);
+      assert.deepEqual(saved.result, job.result);
+    } else {
+      assert.equal(saved.event.media_path, row.file);
+      assert.equal(saved.event.media_file_sha256, row.file_sha);
+      assert.equal(saved.next_attempt_at_ms, 0);
+    }
+  });
+}

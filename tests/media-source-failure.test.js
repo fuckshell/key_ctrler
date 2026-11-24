@@ -246,8 +246,8 @@ test('passive source upgrades preserve inference attempts and dispatch verified 
     assert.equal(row.status,'pending');
     // Source evidence is dispatched once even when the old source budget is exhausted.
     assert.equal(recovered.length,1);
-    assert.equal(recovery.dispatched.length-dispatchedBefore,1);
-    assert.equal(recovery.dispatched.at(-1).length, 0);
+    assert.equal(recovery.dispatched.length-dispatchedBefore,attempts < 2 ? 1 : 0);
+    if (attempts < 2) assert.deepEqual([...recovery.dispatched.at(-1)], [id, row.file_sha]);
     if (attempts>=2) assert.equal(row.vision_state,'repair_required');
     // A delayed resolver snapshot must not restore its older inference budget.
     recovery.appendManifest({...row,vision_attempts:0});
@@ -277,4 +277,110 @@ test('foreground images leave download ownership to WeChat under every legacy fl
     assert.equal(media.calls.length,0);
     assert.equal(JSON.stringify(row),before);
   }
+});
+
+test('a recall requires the exact image identity and a native revoke notice', () => {
+  const {imageRecallReceipt} = fixture('wechat-pc-media.js', 'module.exports.imageRecallReceipt=imageRecallReceipt;');
+  const row = {talker:'example', local_id:1, message_create_time:20, server_id:'90071992547409933',
+    message_key:'example|1|20|90071992547409933'};
+  const current = {local_id:1, create_time:20, server_id:row.server_id, local_type:10000,
+    message_content:'<sysmsg type="revokemsg"><revokemsg></revokemsg></sysmsg>'};
+  assert.equal(imageRecallReceipt(row,current).kind,'wechat-revokemsg');
+  for (const change of [{local_type:3},{server_id:'90071992547409934'},{message_content:'other system notice'}])
+    assert.equal(imageRecallReceipt(row,{...current,...change}),null);
+});
+test('a late write to the watched middle path wakes only its message', async () => {
+  const {watch, stop} = fixture('wechat-pc-media.js',
+    'module.exports.watch=watchMiddleArrival; module.exports.stop=key=>middleWatches.get(key)?.();');
+  const file = path.join(root, 'later.jpg');
+  let wake;
+  const arrived = new Promise(resolve => { wake=resolve; });
+  watch('example', [file], wake);
+  const timeout = setTimeout(()=>wake('timeout'), 4000);
+  try {
+    await new Promise(resolve=>setTimeout(resolve,100));
+    fs.writeFileSync(file, Buffer.alloc(64));
+    assert.equal(await arrived, 'example');
+  } finally {clearTimeout(timeout); stop('example');}
+});
+
+test('file arrivals wait for a busy scan and duplicate queued wakes share one pass', async () => {
+  const {scheduler} = fixture('wechat-pc-bridge.js', 'module.exports.scheduler=imageScanScheduler;');
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const seen = [];
+  const schedule = scheduler(async key => { seen.push(key); if (!key) await gate; });
+  const periodic = schedule();
+  await Promise.resolve();
+  const first = schedule('message');
+  assert.equal(first, schedule('message'));
+  assert.deepEqual(seen, ['']);
+  release();
+  await Promise.all([periodic, first]);
+  assert.deepEqual(seen, ['', 'message']);
+});
+
+test('a screened thumbnail hands the stable middle path to the original waiting job', async () => {
+  const crypto = require('node:crypto');
+  const digest = value => crypto.createHash('sha256').update(value).digest('hex');
+  const {scheduler} = fixture('wechat-pc-bridge.js', 'module.exports.scheduler=imageScanScheduler;');
+  const recovery = fixture('wechat-pc-media.js', `
+    getFilesRoot = async () => WORKSPACE_WECHAT;
+    findAccountDir = () => WORKSPACE_WECHAT;
+    resolveImageAttachPaths = () => ({extraWsl:path.join(WORKSPACE_WECHAT,'arrival.png')});
+    resolveImageCacheTempPath = () => null;
+    hookRequest = async () => { throw new Error('offline fixture'); };
+    triggerDistill = () => {};
+    module.exports.run = retryImageSources;
+    module.exports.stop = key => middleWatches.get(key)?.();
+    module.exports.watchCount = () => middleWatches.size;
+  `);
+  const ingest = fixture('wechat-ingest.js', 'schedulePostprocessWorker=()=>{};');
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
+  const ts = 1795050100000, key = 'test|71|1795050100|77';
+  const source = path.join(root, 'arrival.png');
+  const thumb = digest('distinct fixture thumbnail');
+  const row = {id:key, message_key:key, ts, local_id:71, server_id:'77', talker:'test',
+    source:'pc-hook', kind:'image', image_hash:'1'.repeat(32), status:'pending',
+    middle_pending:true, file_sha:thumb, thumbnail_sha256:thumb, captured_tier:'thumbnail'};
+  recovery.appendManifest(row);
+  const event = {ts, talker:'test', local_id:71, type:3, content:'[图片]', media_kind:'image',
+    media_message_key:key, media_captured_tier:'thumbnail', media_middle_pending:true,
+    media_file_sha256:thumb, media_thumbnail_sha256:thumb};
+  const original = ingest.enqueuePostprocess(event).job;
+  original.attempts=1;
+  original.last_error='image-tier-not-ready';
+  const rows=new Map([[key,row]]);
+  let done, fail, timeout;
+  const received=new Promise((resolve,reject)=>{done=resolve; fail=reject;});
+  const scan=scheduler(async () => {
+    const results=await recovery.run({}, rows, Date.now(), true, scan);
+    for (const result of results) {
+      const receipt=ingest.enqueuePostprocess({...event, media_recovered:true, media_file_sha256:result.file_sha});
+      done(receipt);
+    }
+  });
+  try {
+    await scan();
+    assert.equal(recovery.watchCount(),0);
+    const dir=path.join(root,'state/image-inference-budget');
+    fs.mkdirSync(dir,{recursive:true});
+    fs.writeFileSync(path.join(dir,digest(thumb)+'.json'),JSON.stringify({
+      waiting_source:true,last_error:'image-tier-not-ready',coarse_screening:{
+        ok:true,screening_decision:'needs_detail',screening_relevance:'relevant',
+        model:'gemini-3.8-flash-medium',provider:'antigravity-subscription'}}));
+    await scan();
+    assert.equal(recovery.watchCount(),1);
+    fs.writeFileSync(source,png.subarray(0,40));
+    await new Promise(resolve=>setTimeout(resolve,650));
+    assert.equal(original.event.media_file_sha256,thumb);
+    fs.appendFileSync(source,png.subarray(40));
+    timeout=setTimeout(()=>fail(new Error('missing stable source wake')),7000);
+    const receipt=await received;
+    assert.equal(receipt.job,original);
+    assert.equal(original.attempts,1);
+    assert.equal(original.event.media_captured_tier,'middle');
+    assert.equal(digest(fs.readFileSync(original.event.media_path)),digest(png));
+    assert.equal(original.event.media_middle_pending,false);
+  } finally {clearTimeout(timeout); recovery.stop(key);}
 });

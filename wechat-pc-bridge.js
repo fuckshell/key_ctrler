@@ -1327,6 +1327,23 @@ async function pollOnce(cfg, state) {
   }
 }
 
+// Serialize file notifications with the periodic scan. A notification arriving
+// during its own scan must get a second pass over a fresh manifest snapshot.
+function imageScanScheduler(scan) {
+  let tail = Promise.resolve();
+  const waiting = new Map();
+  return function schedule(key = "") {
+    if (waiting.has(key)) return waiting.get(key);
+    const next = tail.then(() => {
+      waiting.delete(key);
+      return scan(key);
+    });
+    waiting.set(key, next);
+    tail = next.catch(() => {});
+    return next;
+  };
+}
+
 async function main() {
   const cfg = loadConfig();
   if (!cfg.ingest_token) {
@@ -1349,20 +1366,17 @@ async function main() {
   // media recovery independent of a potentially long full SessionTable pass.
   // The resolver itself retries only unresolved rows and has an internal
   // cooldown, so this does not touch completed files or the HD image path.
-  let imageRetryRunning = false;
-  const imageRetryTimer = setInterval(async () => {
-    if (imageRetryRunning) return;
-    imageRetryRunning = true;
-    try {
-      enqueueRecoveredFiles(cfg, state, await retryHdPendingManifest(cfg, { passiveOnly: true }));
-      // Processing receipts can wait on ingest/network. Release the image
-      // scan guard immediately so that it cannot stall source discovery.
-      void processRecoveredFileQueue(cfg, state).catch(err => {
-        console.error("[wechat-bridge] image recovery queue failed:", err.message);
-      });
-    } catch (err) {
-      console.error("[wechat-bridge] image source check failed:", err.message);
-    } finally { imageRetryRunning = false; }
+  const scanImages = imageScanScheduler(async messageKey => {
+    const ready = await retryHdPendingManifest(cfg, {
+      force: Boolean(messageKey), passiveOnly: true, messageKey, onMiddleArrival: scanImages,
+    });
+    enqueueRecoveredFiles(cfg, state, ready);
+    void processRecoveredFileQueue(cfg, state).catch(err => {
+      console.error("[wechat-bridge] image recovery queue failed:", err.message);
+    });
+  });
+  const imageRetryTimer = setInterval(() => {
+    scanImages().catch(err => console.error("[wechat-bridge] image source check failed:", err.message));
   }, 10000);
   imageRetryTimer.unref();
   let mediaRetryRunning = false;
