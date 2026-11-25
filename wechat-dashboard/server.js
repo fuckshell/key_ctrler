@@ -277,6 +277,10 @@ function canonicalQueueCounts(mediaRows, postprocessJobs = readPostprocessJobs()
       claimedMedia.get(key).push(shared);
     }
     const status = String(job.status || "");
+    const unsupportedMediaOutcome = job.retry_exhausted === true &&
+      String(job.last_error || "") === "screening-unavailable" &&
+      String(job.event?.media_status || "") === "unsupported_kind";
+    if (unsupportedMediaOutcome) continue;
     const attempts = Number(job.attempts || 0);
     const memoryStatus = String(job.memory_status || "");
     const memoryAttempts = Number(job.memory_attempts || 0);
