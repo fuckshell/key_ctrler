@@ -325,6 +325,12 @@ function canonicalQueueCounts(mediaRows, postprocessJobs = readPostprocessJobs()
     const businessStatus = mediaBusinessStatus(row);
     const matched = [...new Set([...rowKeys].flatMap(key => claimedMedia.get(key) || []))];
     if (matched.length) {
+      // Awaiting owner evidence is a terminal business outcome for the
+      // automatic worker. Its manifest row can still be pending because the
+      // original media source was unavailable, but that audit state must not
+      // reintroduce a retry after the matching postprocess job was skipped
+      // above by isAwaitingEvidence().
+      if (matched.every(value => value.state === null)) continue;
       // Calendar/memory completion cannot certify unread media. Merge the
       // real message phases by retry > new > success, counting it once.
       const priority = {success: 0, new: 1, retry: 2};
