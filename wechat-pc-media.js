@@ -3521,6 +3521,27 @@ function saveSourceChecks(checks) {
   fs.renameSync(temp, IMAGE_CHECK_STATE);
 }
 
+// Compressed native containers and CDN length describe different encodings.
+// Only an exact middle source may bypass the size hint or the JPEG suffix.
+function middleContainer(file, exactDat, exactCopy) {
+  if (file !== exactDat && file !== exactCopy) return false;
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const head = Buffer.alloc(6);
+    if (fs.readSync(fd, head, 0, head.length, 0) !== head.length) return false;
+    return head.toString('ascii', 0, 4) === 'wxgf' ||
+      (file === exactDat && ['070856310807', '070856320807'].includes(head.toString('hex')));
+  } catch { return false; }
+  finally { if (fd !== undefined) fs.closeSync(fd); }
+}
+
+function verifiedCompactMiddle(before, after, similarity) {
+  return Number.isFinite(similarity) && similarity >= 0.78 &&
+    before?.width > 0 && before?.height > 0 && after?.width >= before.width &&
+    after.height >= before.height && (after.width > before.width || after.height > before.height);
+}
+
 function imageSourceCheckReady(check, signature, now) {
   if (check.signature !== signature) return false;
   // The budget belongs to unchanged source bytes and survives bridge restarts.
@@ -3681,10 +3702,11 @@ async function retryImageSources(cfg, latestByMessage, now, force, onMiddleArriv
       }
       const waitingForMiddle = row.middle_pending === true &&
         effectiveCapturedTier(row) === 'thumbnail';
+      const middleCopy = row.cdn_middle_fileid ? hookAutoInboxPath(row.cdn_middle_fileid).replace(/\.jpg$/, ".middle.jpg") : null;
       const sources = [paths?.extraWsl,
         ...["mid_temp_convert", "mid_temp"].map(suffix =>
           resolveImageCacheTempPath(accountDir, row.talker, row.local_id, ct, suffix)?.wsl),
-        row.cdn_middle_fileid ? hookAutoInboxPath(row.cdn_middle_fileid).replace(/\.jpg$/, ".middle.jpg") : null];
+        middleCopy];
       // Previously observed paths are safe only when their basename is exact.
       for (const hint of [row.source_dat, row.passive_upgrade_source_path]) {
         if (hint && path.basename(hint) === row.image_hash + ".dat") sources.push(hint);
@@ -3707,9 +3729,10 @@ async function retryImageSources(cfg, latestByMessage, now, force, onMiddleArriv
         const expectedMiddle = Number(row.middle_expected_bytes || 0);
         const sourceTooSmall = waitingForMiddle && expectedMiddle > 0 &&
           stat.size < Math.floor(expectedMiddle * 0.8);
-        const incompleteRaster = waitingForMiddle &&
+        const container = waitingForMiddle && middleContainer(src, paths?.extraWsl, middleCopy);
+        const incompleteRaster = waitingForMiddle && !container &&
           /\.(?:jpe?g|png)$/i.test(src) && !isCompleteRasterImage(src);
-        if (thumbnailOnly || sourceTooSmall || incompleteRaster) continue;
+        if (thumbnailOnly || (sourceTooSmall && !container) || incompleteRaster) continue;
         sourcePresent = true;
         const key = `${identity}|${src}`;
         const signature = `${stat.size}|${stat.mtimeMs}`;
@@ -3720,7 +3743,7 @@ async function retryImageSources(cfg, latestByMessage, now, force, onMiddleArriv
           continue;
         }
         if (!imageSourceCheckReady(check, signature, now)) continue;
-        ready.push({ row, src, stat, key, signature, important, check });
+        ready.push({ row, src, stat, key, signature, important, check, compact: sourceTooSmall && container });
       }
       if (!sourcePresent && wantsMiddle && nativeBudget > 0) {
         let contactedNative = false;
@@ -3791,7 +3814,8 @@ async function retryImageSources(cfg, latestByMessage, now, force, onMiddleArriv
       }
       const oldImage = row.canonical_file || row.file;
       const similarity = rasterContentSimilarity(oldImage, canon.file);
-      if (similarity !== null && similarity < 0.78) { fail(); continue; }
+      if ((item.compact && !verifiedCompactMiddle(readRasterDimensions(oldImage),
+          readRasterDimensions(canon.file), similarity)) || (similarity !== null && similarity < 0.78)) { fail(); continue; }
       // Recognition results belong to bytes; attempts and failure history
       // belong to the message and must survive source acquisition.
       const pathOnly = hasCompletedThumbnailScreen(row);
@@ -3868,6 +3892,8 @@ module.exports = {
   readImageDemands,
   selectPassiveImageCandidates,
   imageSourceCheckReady,
+  middleContainer,
+  verifiedCompactMiddle,
   extractAttachmentFileNames,
   attachmentMetadata,
   fetchExactMessageRow,
