@@ -3614,21 +3614,35 @@ function watchMiddleArrival(key, sources, wake) {
   }
 }
 
-function shouldResolveMiddle(row, requested) {
-  if (requested) return true;
-  if (!/^[a-f0-9]{64}$/.test(row.file_sha || "")) return false;
+function middleSourceMode(row, requested) {
+  if (requested) return "acquire";
+  if (!/^[a-f0-9]{64}$/.test(row.file_sha || "")) return "skip";
   const spam = row.content_pool === "spam" || resolveTalkerPolicy(row.talker).content_pool === "spam";
-  if (spam || row.filtered_low_value || ["filtered", "discarded"].includes(row.status)) return false;
+  if (spam || row.filtered_low_value || ["filtered", "discarded"].includes(row.status)) return "skip";
   // A finished non-ad screen can retain the middle path for later questions
   // without sending the image through recognition again.
-  if (hasCompletedThumbnailScreen(row)) return true;
+  if (hasCompletedThumbnailScreen(row)) return "acquire";
   try {
     const key = crypto.createHash("sha256").update(row.file_sha).digest("hex");
     const budget = JSON.parse(fs.readFileSync(path.join(WORKSPACE_WECHAT,
       "state/image-inference-budget", key + ".json"), "utf8"));
-    return budget.waiting_source === true && budget.last_error === "image-tier-not-ready" &&
-      needsNativeMiddle(row, {coarse: budget.coarse_screening || {}});
-  } catch { return false; }
+    if (budget.last_error !== "image-tier-not-ready") return "skip";
+    const coarse = budget.coarse_screening || {};
+    if (budget.waiting_source === true && needsNativeMiddle(row, {coarse})) return "acquire";
+    // Older screens could say complete even though document validation rejected
+    // the thumbnail. Only inspect local files for the still-waiting message;
+    // this receipt cannot authorize a download or complete a business phase.
+    if (row.durable_retry_source === true && row.middle_pending === true &&
+        row.file_sha === row.thumbnail_sha256 && row.status === "pending" &&
+        row.vision_state === "repair_required" && !row.summary && !row.ad_filter_reason &&
+        /(?:^|:)image-tier-not-ready(?:$|:)/.test(row.vision_last_error || "") &&
+        budget.waiting_source === false && coarse.ok === true &&
+        ["document", "table"].includes(coarse.content_type) &&
+        coarse.screening_decision === "summary_complete" && coarse.screening_relevance === "irrelevant" &&
+        ["gemini", "antigravity-subscription"].includes(coarse.provider) && /flash/i.test(coarse.model || "") &&
+        Array.isArray(coarse.evidence) && coarse.evidence.some(v => typeof v === "string" && v.trim())) return "local";
+    return "skip";
+  } catch { return "skip"; }
 }
 
 function hasCompletedThumbnailScreen(row) {
@@ -3711,7 +3725,8 @@ async function retryImageSources(cfg, latestByMessage, now, force, onMiddleArriv
       for (const hint of [row.source_dat, row.passive_upgrade_source_path]) {
         if (hint && path.basename(hint) === row.image_hash + ".dat") sources.push(hint);
       }
-      const wantsMiddle = shouldResolveMiddle(row, important);
+      const middleMode = middleSourceMode(row, important);
+      const wantsMiddle = middleMode !== "skip";
       // A pre-existing file is subject to the same screening decision as a
       // later file notification. Never run a second read for an ad.
       if (waitingForMiddle && !wantsMiddle) continue;
@@ -3745,7 +3760,7 @@ async function retryImageSources(cfg, latestByMessage, now, force, onMiddleArriv
         if (!imageSourceCheckReady(check, signature, now)) continue;
         ready.push({ row, src, stat, key, signature, important, check, compact: sourceTooSmall && container });
       }
-      if (!sourcePresent && wantsMiddle && nativeBudget > 0) {
+      if (!sourcePresent && middleMode === "acquire" && nativeBudget > 0) {
         let contactedNative = false;
         await requestNativeMiddle(row, {
           stateDir: path.join(WORKSPACE_WECHAT, 'state/native-middle-receipts'), now,
@@ -3893,6 +3908,7 @@ module.exports = {
   selectPassiveImageCandidates,
   imageSourceCheckReady,
   middleContainer,
+  middleSourceMode,
   verifiedCompactMiddle,
   extractAttachmentFileNames,
   attachmentMetadata,
